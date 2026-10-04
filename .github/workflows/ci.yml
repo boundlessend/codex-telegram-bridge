@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install metadata tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl qpdf
+      - name: Install metadata tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install exiftool qpdf
+      - run: npm ci --ignore-scripts --audit=false
+      - run: npm run verify
+      - run: python3 -m compileall -q runtime scripts/clean-metadata.py
+      - run: npm pack --dry-run --json
+      - name: Audit dependencies
+        if: runner.os == 'Linux'
+        run: npm run audit:ci -- --audit-level moderate --attempts 3 --retry-delay-ms 10000

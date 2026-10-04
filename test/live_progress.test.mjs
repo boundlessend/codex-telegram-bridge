@@ -1,0 +1,101 @@
+import { textFor } from "../src/i18n.js";
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createLiveProgressController } from "../src/ui/live_progress.js";
+
+function createFixture({ enabled = true, source = "both", policy = "always", progressStore } = {}) {
+  const sent = [];
+  const controller = createLiveProgressController({
+    progressStore,
+    settings: {
+      runtimeValue(key) {
+        if (key === "telegramLiveProgressMode") return "brief";
+        if (key === "telegramLiveProgressIntervalMs") return 0;
+        if (key === "telegramFormatCodexAnswers") return "safe";
+        if (key === "maxTelegramChars") return 4096;
+        return 0;
+      }
+    },
+    options: {
+      get: () => ({ liveProgressEnabled: enabled, liveProgressSource: source, liveProgressDeletePolicy: policy }),
+      defaults: () => ({ liveProgressDeletePolicy: policy })
+    },
+    telegram: {
+      getChatKey: () => "chat",
+      replyTracked: async (_ctx, _state, html) => { sent.push(html); }
+    },
+    recovery: { recordProgressFailed: async () => {} },
+    localization: {
+      language: () => "en",
+      forLanguage: textFor,
+      formatForLanguage: (_language, key, values) => `${key}:${Object.values(values).join(",")}`
+    },
+    formatting: {
+      redact: (value) => value,
+      truncate: (value, max) => String(value ?? "").slice(0, max)
+    },
+    now: () => 1000
+  });
+  return { controller, sent };
+}
+
+test("live progress combines agent and activity views and suppresses duplicates", async () => {
+  const { controller, sent } = createFixture();
+  const state = controller.createLiveProgressState({});
+  state.chatKey = "chat";
+  const event = {
+    type: "item.completed",
+    item: { id: "message", type: "agent_message", text: "Working" }
+  };
+
+  assert.equal(await controller.maybeSendLiveProgress({}, state, event, [event.item]), true);
+  assert.equal(await controller.maybeSendLiveProgress({}, state, event, [event.item]), false);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /Working/);
+});
+
+test("live progress respects disabled options and deletion policy", async () => {
+  const { controller, sent } = createFixture({ enabled: false });
+  const state = controller.createLiveProgressState();
+  assert.equal(await controller.maybeSendLiveProgress({}, state, { type: "turn.started" }, []), false);
+  assert.equal(sent.length, 0);
+  assert.equal(controller.shouldDeleteLiveProgress(state, false), true);
+});
+
+test("progress summary and final response formatting stay deterministic", () => {
+  const { controller } = createFixture();
+  assert.equal(controller.formatTurn({ finalResponse: "  done  " }), "done");
+  assert.equal(controller.summarizeProgress([
+    { type: "reasoning" },
+    { type: "command_execution", command: "npm test" }
+  ]), "Codex progress\nreasoning:1\ncmd:1\nlast: npm test");
+});
+
+test("restored progress preserves always, on_success, and never deletion policies", () => {
+  for (const [policy, onSuccess, onFailure] of [["always", true, true], ["on_success", true, false], ["never", false, false]]) {
+    const { controller } = createFixture({ policy, enabled: false });
+    const state = controller.createLiveProgressState({ currentPreparedTurn: { id: "turn" } }, "chat");
+    assert.equal(controller.shouldDeleteLiveProgress(state, true), onSuccess);
+    assert.equal(controller.shouldDeleteLiveProgress(state, false), onFailure);
+  }
+});
+
+test("ignored config warnings do not appear as live errors before the turn starts", async () => {
+  const { controller, sent } = createFixture({ source: "activity" });
+  const state = controller.createLiveProgressState();
+  state.chatKey = "chat";
+  const warning = "Codex is ignoring 2 unrecognized configuration settings. Check for typos or deprecated settings.";
+
+  for (const id of ["item_0", "item_1"]) {
+    assert.equal(await controller.maybeSendLiveProgress({}, state, {
+      type: "item.completed", item: { id, type: "error", message: warning }
+    }, []), false);
+  }
+  assert.equal(await controller.maybeSendLiveProgress({}, state, { type: "turn.started" }, []), true);
+  assert.deepEqual(sent, [textFor("en", "liveTurnStarted")]);
+
+  assert.equal(await controller.maybeSendLiveProgress({}, state, {
+    type: "item.completed", item: { id: "real_error", type: "error", message: "Connection failed." }
+  }, []), true);
+  assert.equal(sent.at(-1), textFor("en", "liveItemError"));
+});

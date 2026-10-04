@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Telegram Bridge"
+  short_description: "Set up and maintain your local Telegram bridge"
+  default_prompt: "Use $codex-telegram-bridge to inspect my Telegram bridge installation and report verified service health."

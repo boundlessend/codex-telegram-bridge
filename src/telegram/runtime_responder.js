@@ -1,0 +1,242 @@
+import { createMessageFormatter } from "../i18n.js";
+import path from "node:path";
+import { replyFormattedCodexAnswer } from "./codex_answer.js";
+import { b, code } from "./html.js";
+import {
+  retryTelegramRateLimit,
+  editOrReplyTelegramHtml,
+  replyTelegramHtml,
+  sendTelegramHtml,
+  summarizeTelegramError
+} from "./api.js";
+import { splitText } from "./split.js";
+import { prepareSharedFile } from "./file_hygiene.js";
+import { extractTelegramPhotoArtifacts } from "./attachments.js";
+import { replyTelegramPhotos } from "./photo.js";
+import { sameRef } from "./progress_store.js";
+
+export function createTelegramRuntimeResponder({ bot, settings, localization, progressStore, logger = console }) {
+  const msg = createMessageFormatter(localization?.text);
+
+  async function replyLong(ctx, text) {
+    const max = Math.max(500, settings.runtimeValue("maxTelegramChars"));
+    let last;
+    for (const chunk of splitText(text, max)) last = await retryTelegramRateLimit(() => ctx.reply(chunk));
+    return last;
+  }
+
+  async function replyCodexAnswer(ctx, text, delivery) {
+    const currentFormat = { format: settings.runtimeValue("telegramFormatCodexAnswers"), maxTelegramChars: settings.runtimeValue("maxTelegramChars"), workingDirectory: delivery?.workingDirectory || settings.getWorkingDirectory(ctx) };
+    const format = delivery?.format || currentFormat;
+    await delivery?.saveFormat?.(format);
+    await replyFormattedCodexAnswer(ctx, text, {
+      ...format,
+      delivery,
+      extractPhotoArtifacts: (body) => extractTelegramPhotoArtifacts(body, { allowedRoots: [path.join(format.workingDirectory, "outputs")], allowedExtensions: new Set([".png", ".jpg", ".jpeg"]) }),
+      replyPhotos: async (context, photos, options) => {
+        const sent = [];
+        for (const photo of photos) {
+          const cleaned = await prepareSharedFile(photo.path, settings.config);
+          try {
+            const report = `Метаданные: ${cleaned.actions.join("; ") || "не найдены"}`;
+            const caption = `${(photo.caption || "").slice(0, Math.max(0, 1023 - report.length))}\n${report}`;
+            const messages = await replyTelegramPhotos(context, [{ ...photo, caption, path: cleaned.path }], options);
+            sent.push(...messages);
+          } finally { await cleaned.cleanup(); }
+        }
+        return sent;
+      },
+      replyHtml,
+      replyLong,
+      text: localization?.text
+    });
+  }
+
+  async function replyHtml(ctx, html, extra = {}) {
+    return replyTelegramHtml(ctx, html, extra, { logger: console });
+  }
+
+  async function editOrReplyHtml(ctx, html, extra = {}) {
+    return editOrReplyTelegramHtml(ctx, html, extra, { logger: console });
+  }
+
+  async function editSelectionMessageStrict(ctx, html, extra) {
+    try {
+      await editOrReplyTelegramHtml(ctx, html, extra, {
+        logger: console,
+        replyOnUnavailable: false
+      });
+      return true;
+    } catch (error) {
+      console.warn("Telegram selection message edit failed:", summarizeTelegramError(error));
+      return false;
+    }
+  }
+
+  async function answerUiCallback(ctx, edited) {
+    try {
+      if (edited) await ctx.answerCbQuery();
+      else {
+        await ctx.answerCbQuery(localization.text("selectionUpdateFailed"), {
+          show_alert: true
+        });
+      }
+    } catch (error) {
+      console.warn("Telegram UI callback answer failed:", summarizeTelegramError(error));
+    }
+  }
+
+  async function replyTrackedProgressHtml(ctx, progressState, html) {
+    const message = await replyHtml(ctx, html);
+    await trackProgressMessage(ctx, progressState, message);
+    return message;
+  }
+
+  async function trackProgressMessage(ctx, progressState, message) {
+    const chatId = message?.chat?.id ?? ctx.chat?.id;
+    const messageId = message?.message_id;
+    if (!progressState || !chatId || !messageId) return;
+    const ref = { chatId, messageId };
+    progressState.messageRefs ||= [];
+    if (!progressState.messageRefs.some((existing) => sameRef(existing, ref))) {
+      progressState.messageRefs.push(ref);
+    }
+    await progressStore?.track(progressState, ref);
+  }
+
+  async function deleteTrackedProgressMessages(ctx, progressState) {
+    if (!progressState) return;
+    const refs = [...(progressState.messageRefs || [])];
+    for (const ref of progressStore?.getRefs(progressState) || []) {
+      if (!refs.some((existing) => sameRef(existing, ref))) refs.push(ref);
+    }
+    const removed = [];
+    try {
+      await progressStore?.beginCleanup(progressState);
+    } catch (error) {
+      logger.warn("Telegram progress cleanup could not be persisted:", summarizeTelegramError(error));
+    }
+    for (const ref of refs) {
+      try {
+        await ctx.telegram.deleteMessage(ref.chatId, ref.messageId);
+        removed.push(ref);
+      } catch (error) {
+        const summary = summarizeTelegramError(error);
+        if (summary.code === 400 && /message to delete not found|message can't be deleted/i.test(summary.description)) {
+          removed.push(ref);
+        } else {
+          logger.warn("Telegram progress deletion will be retried:", summary);
+          // Respect rate limits and leave the rest for a later recovery pass.
+          if (summary.code === 429) break;
+        }
+      }
+    }
+    progressState.messageRefs = refs.filter((ref) => !removed.some((item) => sameRef(item, ref)));
+    try {
+      await progressStore?.remove(progressState, removed);
+    } catch (error) {
+      logger.warn("Telegram progress cleanup result could not be persisted:", summarizeTelegramError(error));
+    }
+  }
+
+  async function retryPendingProgressCleanup() {
+    if (!progressStore) return;
+    try {
+      await progressStore.prune();
+      for (const progressState of progressStore.pending()) {
+        await deleteTrackedProgressMessages({ telegram: bot.telegram }, progressState);
+      }
+    } catch (error) {
+      logger.warn("Telegram progress cleanup retry failed:", summarizeTelegramError(error));
+    }
+  }
+
+  async function replyDocumentQuietly(ctx, filePath, caption) {
+    try {
+      const cleaned = await prepareSharedFile(filePath, settings.config);
+      try {
+        await ctx.replyWithDocument(
+          { source: cleaned.path, filename: path.basename(filePath) },
+          { caption: `${caption || ""}\nМетаданные: ${cleaned.actions.join("; ") || "не найдены"}`.slice(0, 1024) }
+        );
+      } finally { await cleaned.cleanup(); }
+    } catch (error) {
+      await replyHtml(
+        ctx,
+        msg("ui.documentUploadFailed", { path: code(filePath), error: code(summarizeTelegramError(error).description) })
+      );
+    }
+  }
+
+  async function sendHtmlMessage(chatId, html, extra = {}) {
+    return sendTelegramHtml(bot.telegram, chatId, html, extra, { logger: console });
+  }
+
+  function helpTextHtml() {
+    return [
+      b(msg("ui.codexTelegramBot")),
+      "",
+      b(localization.text("commandsCore")),
+      code("/menu"),
+      code("/new"),
+      code("/resume [thread-id|last]"),
+      code("/status"),
+      code("/queue"),
+      code("/settings"),
+      code("/tools"),
+      code("/skills"),
+      code("/stop"),
+      code("/help"),
+      "",
+      b(localization.text("buttonPanels")),
+      `${code("/menu")}: ${localization.text("menuHelp")}`,
+      `${code("/settings")}: ${localization.text("settingsHelp")}`,
+      `${code("/tools")}: ${localization.text("toolsHelp")}`,
+      `${code("/queue")}: ${localization.text("queueHelp")}`,
+      "",
+      b(localization.text("advancedCommands")),
+      code("/threads"),
+      code("/queue_pause /queue_resume /queue_mode_safe"),
+      code("/model /reasoning /sandbox /approval"),
+      code("/workdir /adddir /schema"),
+      code("/logs /doctor /backup /export /cleanup"),
+      "",
+      msg("ui.supportedInputs")
+    ].join("\n");
+  }
+
+  async function reactQuietly(ctx, emoji, isBig = false) {
+    if (!settings.runtimeValue("telegramReactionsEnabled") || !emoji || !ctx.message) return;
+    try {
+      await ctx.react(emoji, isBig);
+    } catch (error) {
+      console.warn("Telegram reaction failed:", summarizeTelegramError(error));
+    }
+  }
+
+  async function editMessageQuietly(ctx, messageId, text) {
+    try {
+      await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text);
+    } catch {
+      // Progress edits are best-effort.
+    }
+  }
+
+  return {
+    answerUiCallback,
+    deleteTrackedProgressMessages,
+    editMessageQuietly,
+    editOrReplyHtml,
+    editSelectionMessageStrict,
+    helpTextHtml,
+    reactQuietly,
+    replyCodexAnswer,
+    replyDocumentQuietly,
+    replyHtml,
+    replyLong,
+    replyTrackedProgressHtml,
+    retryPendingProgressCleanup,
+    sendHtmlMessage,
+    trackProgressMessage
+  };
+}

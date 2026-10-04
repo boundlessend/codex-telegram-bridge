@@ -1,0 +1,17 @@
+[Unit]
+Description=Codex Telegram Bot
+Wants=codex-telegram-worker.service
+After=network-online.target codex-telegram-worker.service
+
+[Service]
+Type=simple
+UMask=0077
+WorkingDirectory=%h/codex-telegram-bridge
+EnvironmentFile=%h/codex-telegram-bridge/.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node %h/codex-telegram-bridge/src/bot.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

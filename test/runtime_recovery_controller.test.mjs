@@ -1,0 +1,529 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
+import {
+  createRuntimeRecoveryController,
+  createWorkerRecoveryTurn,
+  isWorkerCancelledMessage
+} from "../src/recovery/runtime_controller.js";
+import { readActiveTurnSnapshots, replaceActiveTurnSnapshot } from "../src/recovery/state.js";
+import { loadProgressMessageStore } from "../src/telegram/progress_store.js";
+import { createTelegramRuntimeResponder } from "../src/telegram/runtime_responder.js";
+import { createLiveProgressController } from "../src/ui/live_progress.js";
+import { workerDeliveryKey } from "../src/worker/delivery.js";
+
+async function createHarness(t, {
+  enabled = true,
+  workerEnabled = false,
+  workerJob = null,
+  workerResult = null,
+  workerEvents = [],
+  turnOverrides = {}
+} = {}) {
+  const recoveryDir = await fs.mkdtemp(path.join(os.tmpdir(), "runtime-recovery-"));
+  t.after(() => fs.rm(recoveryDir, { recursive: true, force: true }));
+  const activeTurns = new Map();
+  const events = [];
+  const exits = [];
+  const replies = [];
+  const stops = [];
+  const warnings = [];
+  const deliveries = {};
+  const deliveryTransitions = [];
+  const drains = [];
+  const queuedRecoveryTurns = [];
+  const startedPreparedTurns = [];
+  const answerReplies = [];
+  const completed = [];
+  const reactions = [];
+  const chat = { threadId: "" };
+  const controller = createRuntimeRecoveryController({
+    settings: {
+      enabled,
+      recoveryDir,
+      recoveryStaleSeconds: 3600,
+      recoverySuspendAfter: 3,
+      recoveryTurnTtlSeconds: 7200,
+      workingDirectory: "/workspace",
+      restartExitCode: 75,
+      restartDrainTimeoutSeconds: 0,
+      restartDelaySeconds: 0,
+      stoppedReaction: "stop",
+      errorReaction: "error",
+      completeReaction: "done"
+    },
+    stateStore: {
+      activeTurns,
+      getWorkerDeliveries: () => deliveries,
+      replaceWorkerDeliveries: (next) => Object.assign(deliveries, next),
+      getChat: () => chat,
+      save: async () => {}
+    },
+    queue: {
+      enqueueFrontForced: async (_chatKey, preparedTurn) => queuedRecoveryTurns.unshift(preparedTurn),
+      dequeue: async () => queuedRecoveryTurns.shift() || null,
+      startPrepared: async (...args) => startedPreparedTurns.push(args),
+      startDrain: async (...args) => drains.push(args)
+    },
+    worker: {
+      enabled: () => workerEnabled,
+      getClient: () => ({
+        status: async () => {
+          throw new Error("worker unavailable");
+        },
+        getJobStatus: async () => ({ job: workerJob }),
+        readJobEvents: async () => ({ events: workerEvents })
+      }),
+      waitForJob: async () => {
+        if (workerResult) return workerResult;
+        throw new Error("unused");
+      },
+      transport: () => "sdk"
+    },
+    turn: {
+      appendRecoveryEvent: async (event) => events.push(event),
+      createCodexThread: () => ({}),
+      createLiveProgressState: () => ({}),
+      createSyntheticCtx: () => ({}),
+      deleteTrackedProgressMessages: async () => {},
+      digestText: () => "digest",
+      formatTurn: (result) => result?.response || "",
+      markActiveTurnStopped: async () => {},
+      recordActiveTurnCompleted: async (...args) => completed.push(args),
+      recordActiveTurnFailed: async () => {},
+      recordTelegramReplyCompleted: async () => deliveryTransitions.push("completed"),
+      recordTelegramReplyDigestMismatch: async () => {},
+      recordTelegramReplyFailed: async () => deliveryTransitions.push("failed"),
+      recordTelegramReplyReady: async () => deliveryTransitions.push("ready"),
+      recordTelegramReplyStarted: async () => deliveryTransitions.push("started"),
+      shouldDeleteLiveProgress: () => false,
+      tryBackfillCompletedStream: async () => false,
+      ...turnOverrides
+    },
+    telegram: {
+      notifyExtra: () => ({}),
+      reactQuietly: async (...args) => reactions.push(args),
+      replyCodexAnswer: async (...args) => answerReplies.push(args),
+      replyHtml: async (...args) => replies.push(args),
+      sendHtmlMessage: async () => ({})
+    },
+    formatting: {
+      restartRecovered: () => "recovered",
+      restartScheduled: () => "scheduled"
+    },
+    lifecycle: {
+      stopBot: (signal) => stops.push(signal),
+      exit: (code) => exits.push(code)
+    },
+    text: (key) => key,
+    sleep: async () => {},
+    logger: {
+      warn: (...args) => warnings.push(args),
+      error: (...args) => warnings.push(args)
+    }
+  });
+  return {
+    activeTurns,
+    answerReplies,
+    completed,
+    controller,
+    deliveries,
+    deliveryTransitions,
+    drains,
+    events,
+    exits,
+    reactions,
+    recoveryDir,
+    replies,
+    startedPreparedTurns,
+    stops,
+    warnings
+  };
+}
+
+test("runtime recovery scheduler records worker health and empty startup plans", async (t) => {
+  const { controller, events, warnings } = await createHarness(t, {
+    workerEnabled: true
+  });
+
+  await controller.startRecoveryScheduler();
+
+  assert.deepEqual(events.map((event) => event.type), [
+    "worker_startup_status_failed",
+    "worker_delivery_recovery_plan",
+    "startup_recovery_plan"
+  ]);
+  assert.equal(events[1].safe, 0);
+  assert.equal(events[2].candidates, 0);
+  assert.equal(warnings.length, 1);
+});
+
+test("startup removes a failed delivery snapshot without replaying its completed job", async (t) => {
+  const harness = await createHarness(t, {
+    workerEnabled: true,
+    workerJob: { id: "job-1", chatKey: "chat-1", status: "completed", lastSeq: 2 }
+  });
+  harness.deliveries["chat-1:job-1"] = {
+    deliveryStatus: "delivery_failed", ambiguous: true,
+    responseDigest: "sha256:saved", updatedAt: new Date().toISOString()
+  };
+  await replaceActiveTurnSnapshot(harness.recoveryDir, "chat-1", {
+    chatId: "chat-1", workerJobId: "job-1", recoveryEligible: true,
+    threadId: "newer-thread", startedAt: new Date().toISOString()
+  });
+
+  assert.equal(await harness.controller.recoverActiveWorkerJobs({ source: "startup" }), 0);
+  assert.equal((await readActiveTurnSnapshots(harness.recoveryDir)).turns["chat-1"], undefined);
+  assert.equal(harness.deliveries["chat-1:job-1"].deliveryStatus, "delivery_failed");
+  assert.deepEqual(harness.answerReplies, []);
+  assert.equal(harness.events.some(({ type, reason }) =>
+    type === "worker_delivery_snapshot_cleaned" && reason === "delivery_failed"), true);
+});
+
+test("disabled runtime recovery does not initialize or schedule work", async (t) => {
+  const { controller, events, recoveryDir } = await createHarness(t, { enabled: false });
+  await fs.rm(recoveryDir, { recursive: true, force: true });
+
+  await controller.startRecoveryScheduler();
+
+  assert.deepEqual(events, []);
+  await assert.rejects(fs.access(recoveryDir));
+});
+
+test("manual recovery with no candidates reports the no-op decision", async (t) => {
+  const { controller, events } = await createHarness(t);
+
+  const started = await controller.scheduleStartupRecovery({
+    force: true,
+    notifyCtx: {},
+    source: "manual"
+  });
+
+  assert.equal(started, false);
+  assert.deepEqual(events.map((event) => event.type), [
+    "startup_recovery_plan",
+    "manual_recovery_no_candidates"
+  ]);
+});
+
+test("SIGUSR2 schedules one restart marker and the configured planned exit", async (t) => {
+  const { controller, events, exits, recoveryDir } = await createHarness(t);
+
+  await controller.handleProcessSignal("SIGUSR2");
+  await waitForImmediate();
+
+  assert.equal(controller.isRestartScheduled(), true);
+  assert.deepEqual(exits, [75]);
+  assert.equal(events.at(-1).type, "planned_restart_exit");
+  const marker = JSON.parse(await fs.readFile(path.join(recoveryDir, "restart-marker.json"), "utf8"));
+  assert.equal(marker.mode, "sigusr2");
+  assert.equal(marker.requestedBy, "signal");
+});
+
+test("direct SIGINT stops Telegram and exits without writing a restart marker", async (t) => {
+  const { controller, exits, recoveryDir, stops } = await createHarness(t);
+
+  const handled = await controller.handleProcessSignal("SIGINT");
+
+  assert.equal(handled, undefined);
+  assert.deepEqual(stops, ["SIGINT"]);
+  assert.deepEqual(exits, [0]);
+  await assert.rejects(fs.access(path.join(recoveryDir, "restart-marker.json")));
+});
+
+test("worker recovery turns preserve Telegram routing and worker cursor metadata", () => {
+  const turn = createWorkerRecoveryTurn("chat:topic", {
+    chatId: -1001,
+    chatType: "supergroup",
+    messageThreadId: 44,
+    replyToMessageId: 55,
+    originMessageId: 66,
+    originUpdateId: 77,
+    workerJobId: "job-1",
+    workerEventSeq: "9",
+    threadId: "thread-1",
+    recoveryKey: "recovery-1",
+    inputPreview: "resume"
+  }, { now: () => 123 });
+
+  assert.equal(turn.id, "worker-recovery-job-1");
+  assert.equal(turn.chatKey, "chat:topic");
+  assert.equal(turn.chatId, -1001);
+  assert.equal(turn.messageThreadId, 44);
+  assert.equal(turn.kind, "recovery");
+  assert.equal(turn.recovery.workerJobId, "job-1");
+  assert.equal(turn.recovery.workerEventSeq, 9);
+});
+
+test("worker cancellation detection accepts known worker and abort messages only", () => {
+  assert.equal(isWorkerCancelledMessage("The operation was aborted"), true);
+  assert.equal(isWorkerCancelledMessage("Worker job was cancelled"), true);
+  assert.equal(isWorkerCancelledMessage("Cancelled by Telegram bot"), true);
+  assert.equal(isWorkerCancelledMessage("Worker connection failed"), false);
+});
+
+test("running worker snapshots resume through final delivery and queue drain", async (t) => {
+  const workerJob = {
+    id: "job-1",
+    status: "running",
+    threadId: "thread-1",
+    transport: "sdk"
+  };
+  const harness = await createHarness(t, {
+    workerEnabled: true,
+    workerJob,
+    workerResult: {
+      turn: { response: "recovered answer" },
+      threadId: "thread-1"
+    }
+  });
+  await replaceActiveTurnSnapshot(harness.recoveryDir, "chat-1", {
+    chatId: "chat-1",
+    inputPreview: "resume",
+    recoveryEligible: true,
+    startedAt: new Date().toISOString(),
+    workerEventSeq: 4,
+    workerJobId: "job-1"
+  });
+
+  assert.equal(await harness.controller.recoverActiveWorkerJobs({ source: "test" }), 1);
+  for (let index = 0; index < 10; index += 1) {
+    if (harness.events.some(({ type }) => type === "worker_recovery_completed")) break;
+    await waitForImmediate();
+  }
+
+  assert.deepEqual(harness.deliveryTransitions, ["ready", "started", "completed"]);
+  assert.equal(harness.answerReplies.length, 1);
+  assert.equal(harness.answerReplies[0][1], "recovered answer");
+  assert.deepEqual(harness.completed, [["chat-1", "thread-1"]]);
+  assert.equal(harness.drains.length, 1);
+  assert.equal(harness.activeTurns.has("chat-1"), false);
+  assert.deepEqual(
+    harness.events.map(({ type }) => type),
+    [
+      "worker_delivery_recovery_plan",
+      "worker_recovery_started",
+      "worker_recovery_completed"
+    ]
+  );
+  assert.equal(harness.reactions.at(-1)[1], "done");
+});
+
+test("startup recovery converts a restart-failed worker job into a new recovery turn", async (t) => {
+  const workerJob = {
+    id: "job-restarted",
+    status: "failed",
+    accountId: "backup",
+    accountAttemptState: { triedAccountIds: ["default", "backup"], hadActivity: true },
+    threadId: "thread-1",
+    transport: "sdk"
+  };
+  const harness = await createHarness(t, { workerEnabled: true, workerJob });
+  await replaceActiveTurnSnapshot(harness.recoveryDir, "chat-1", {
+    chatKey: "chat-1",
+    chatId: "chat-1",
+    inputPreview: "finish the interrupted work",
+    recoveryEligible: false,
+    recoveryReason: "worker restarted before job completed",
+    startedAt: new Date().toISOString(),
+    threadId: "thread-1",
+    workerEventSeq: 9,
+    workerJobId: "job-restarted"
+  });
+
+  assert.equal(await harness.controller.scheduleStartupRecovery({ source: "startup" }), true);
+
+  assert.equal(harness.startedPreparedTurns.length, 1);
+  const recoveryTurn = harness.startedPreparedTurns[0][1];
+  assert.equal(recoveryTurn.kind, "recovery");
+  assert.equal(recoveryTurn.recovery.threadId, "thread-1");
+  assert.equal(recoveryTurn.recovery.accountId, "backup");
+  assert.deepEqual(recoveryTurn.recovery.accountAttemptState.triedAccountIds, ["default"]);
+  assert.equal(recoveryTurn.recovery.accountAttemptState.hadActivity, true);
+  assert.match(recoveryTurn.inputText, /finish the interrupted work/);
+  const snapshots = await readActiveTurnSnapshots(harness.recoveryDir);
+  assert.equal(snapshots.turns["chat-1"].workerJobId, "");
+  assert.equal(snapshots.turns["chat-1"].recoveryEligible, true);
+  assert.equal(
+    harness.events.some(({ type }) => type === "worker_restart_recovery_armed"),
+    true
+  );
+});
+
+test("startup recovery does not override an explicit user stop after a worker restart", async (t) => {
+  const workerJob = {
+    id: "job-stopped",
+    status: "failed",
+    failureReason: "worker_restart",
+    error: "worker restarted before job completed",
+    threadId: "thread-1"
+  };
+  const harness = await createHarness(t, { workerEnabled: true, workerJob });
+  await replaceActiveTurnSnapshot(harness.recoveryDir, "chat-1", {
+    chatKey: "chat-1",
+    recoveryEligible: false,
+    recoveryReason: "user_stop",
+    startedAt: new Date().toISOString(),
+    threadId: "thread-1",
+    workerJobId: "job-stopped"
+  });
+
+  assert.equal(await harness.controller.scheduleStartupRecovery({ source: "startup" }), false);
+  assert.equal(harness.startedPreparedTurns.length, 0);
+  const snapshots = await readActiveTurnSnapshots(harness.recoveryDir);
+  assert.equal(snapshots.turns["chat-1"].workerJobId, "job-stopped");
+  assert.equal(snapshots.turns["chat-1"].recoveryReason, "user_stop");
+});
+
+test("running worker delivery resumes when a failed duplicate turn replaced its snapshot", async (t) => {
+  const workerJob = {
+    id: "job-1",
+    chatKey: "chat-1",
+    chatId: "chat-1",
+    status: "running",
+    threadId: "thread-1",
+    transport: "sdk"
+  };
+  const harness = await createHarness(t, {
+    workerEnabled: true,
+    workerJob,
+    workerResult: {
+      turn: { response: "recovered answer" },
+      threadId: "thread-1"
+    }
+  });
+  harness.deliveries["chat-1:job-1"] = {
+    chatKey: "chat-1",
+    jobId: "job-1",
+    seq: 4,
+    schemaVersion: 2,
+    deliveryStatus: "streaming"
+  };
+  await replaceActiveTurnSnapshot(harness.recoveryDir, "chat-1", {
+    chatId: "chat-1",
+    inputPreview: "new turn",
+    recoveryEligible: false,
+    recoveryReason: "Active worker job already exists for chat chat-1: job-1",
+    startedAt: new Date().toISOString()
+  });
+
+  assert.equal(await harness.controller.recoverActiveWorkerJobs({ source: "test" }), 1);
+  for (let index = 0; index < 10; index += 1) {
+    if (harness.events.some(({ type }) => type === "worker_recovery_completed")) break;
+    await waitForImmediate();
+  }
+
+  assert.equal(harness.answerReplies.length, 1);
+  assert.equal(harness.answerReplies[0][1], "recovered answer");
+  const started = harness.events.find(({ type }) => type === "worker_recovery_started");
+  assert.equal(started.jobId, "job-1");
+  assert.equal(started.reason, "active_worker_snapshot_mismatch");
+  const repaired = (await readActiveTurnSnapshots(harness.recoveryDir)).turns["chat-1"];
+  assert.equal(repaired.workerJobId, "job-1");
+  assert.equal(repaired.recoveryEligible, true);
+  assert.equal(repaired.recoveryReason, "active_worker_snapshot_mismatch");
+  assert.equal(harness.activeTurns.has("chat-1"), false);
+});
+
+test("running worker delivery does not bypass a stopped snapshot that owns the job", async (t) => {
+  const workerJob = {
+    id: "job-1",
+    chatKey: "chat-1",
+    status: "running",
+    threadId: "thread-1",
+    transport: "sdk"
+  };
+  const harness = await createHarness(t, {
+    workerEnabled: true,
+    workerJob,
+    workerResult: {
+      turn: { response: "must not be delivered" },
+      threadId: "thread-1"
+    }
+  });
+  harness.deliveries["chat-1:job-1"] = {
+    chatKey: "chat-1",
+    jobId: "job-1",
+    seq: 4,
+    schemaVersion: 2,
+    deliveryStatus: "streaming"
+  };
+  await replaceActiveTurnSnapshot(harness.recoveryDir, "chat-1", {
+    chatId: "chat-1",
+    recoveryEligible: false,
+    recoveryReason: "user_stop",
+    workerJobId: "job-1"
+  });
+
+  assert.equal(await harness.controller.recoverActiveWorkerJobs({ source: "test" }), 0);
+  assert.equal(harness.answerReplies.length, 0);
+  assert.equal(harness.activeTurns.has("chat-1"), false);
+});
+
+for (const mode of ["running", "completed", "already_sent", "backfill"]) {
+  test(`restart cleanup removes persisted progress after ${mode} recovery`, async (t) => {
+    const deleted = [];
+    const ctx = { chat: { id: 42 }, telegram: { deleteMessage: async (...args) => deleted.push(args) } };
+    let live, responder;
+    const job = {
+      id: "new-worker-job", chatKey: "42", chatId: 42, progressTurnId: "original-turn",
+      status: mode === "running" ? "running" : "completed", threadId: "thread", lastSeq: 3
+    };
+    const harness = await createHarness(t, {
+      workerEnabled: mode !== "backfill", workerJob: job,
+      workerResult: { turn: { finalResponse: "recovered answer" }, threadId: "thread" },
+      workerEvents: [
+        { seq: 1, type: "item.completed", item: { id: "answer", type: "agent_message", text: "recovered answer" } },
+        { seq: 2, type: "turn.completed" },
+        { seq: 3, type: "worker.job.completed", status: "completed", threadId: "thread" }
+      ],
+      turnOverrides: {
+        createLiveProgressState: (...args) => live.createLiveProgressState(...args),
+        createSyntheticCtx: () => ctx,
+        deleteTrackedProgressMessages: (...args) => responder.deleteTrackedProgressMessages(...args),
+        shouldDeleteLiveProgress: (...args) => live.shouldDeleteLiveProgress(...args),
+        formatTurn: (turn) => turn.finalResponse,
+        tryBackfillCompletedStream: async (_chat, _thread, state) => {
+          state.finalResponse = "recovered answer";
+          return mode === "backfill";
+        }
+      }
+    });
+    const file = path.join(harness.recoveryDir, "progress.json");
+    const priorStore = await loadProgressMessageStore(file);
+    const priorProgress = { chatKey: "42", progressTurnId: "original-turn" };
+    await priorStore.track(priorProgress, { chatId: 42, messageId: 101 });
+    // Reopen the store to exercise actual disk recovery instead of shared RAM.
+    const store = await loadProgressMessageStore(file);
+    live = createLiveProgressController({
+      progressStore: store, options: { get: () => ({ liveProgressDeletePolicy: "always" }) }
+    });
+    responder = createTelegramRuntimeResponder({ progressStore: store, bot: { telegram: ctx.telegram } });
+    if (mode !== "already_sent") {
+      await replaceActiveTurnSnapshot(harness.recoveryDir, "42", {
+        chatId: 42, queueItemId: "new-worker-job", progressTurnId: "original-turn",
+        recoveryEligible: true, threadId: "thread", startedAt: new Date().toISOString(),
+        ...(mode !== "backfill" ? { workerJobId: job.id } : {})
+      });
+    }
+    if (mode === "completed" || mode === "already_sent") {
+      harness.deliveries[workerDeliveryKey("42", job.id)] = {
+        chatKey: "42", jobId: job.id, seq: 3,
+        deliveryStatus: mode === "completed" ? "result_ready" : "delivery_sent",
+        updatedAt: new Date().toISOString()
+      };
+    }
+    if (mode === "backfill") await harness.controller.scheduleStartupRecovery({ source: "test" });
+    else await harness.controller.recoverActiveWorkerJobs({ source: "test" });
+    for (let index = 0; index < 100 && harness.activeTurns.size; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(deleted, [[42, 101]]);
+    assert.deepEqual((await loadProgressMessageStore(file)).getRefs(priorProgress), []);
+    assert.equal(harness.answerReplies.length, mode === "already_sent" ? 0 : 1);
+    assert.equal(harness.activeTurns.size, 0);
+  });
+}

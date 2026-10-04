@@ -1,0 +1,83 @@
+import { localizedErrorDetails, restoreLocalizedError } from "../i18n.js";
+import {
+  applyCodexStreamEvent,
+  codexStreamResult,
+  createCodexStreamState
+} from "../codex/stream.js";
+
+export const WORKER_RESTART_FAILURE_REASON = "worker_restart";
+export const WORKER_RESTART_FAILURE_MESSAGE = "worker restarted before job completed";
+
+export async function reconstructCompletedWorkerJob(client, jobId) {
+  const streamState = createCodexStreamState();
+  let cursor = 0;
+  let terminal = null;
+  let threadId = "";
+  let accountId, selectedAccount;
+
+  while (!terminal) {
+    const response = await client.readJobEvents(jobId, cursor, 500);
+    const events = response.events || [];
+    if (events.length === 0) {
+      const status = await client.getJobStatus(jobId);
+      const job = status?.job;
+      if (!isTerminalWorkerStatus(job?.status)) {
+        throw new Error(`Worker job ${jobId} is not terminal.`);
+      }
+      const lastSeq = Number(job.lastSeq || 0);
+      if (Number.isFinite(lastSeq) && cursor < lastSeq) {
+        throw new Error(`Worker job ${jobId} event log is incomplete (${cursor}/${lastSeq}).`);
+      }
+      terminal = { ...localizedErrorDetails(job), type: `worker.job.${job.status}`, status: job.status, message: job.error || "" };
+      break;
+    }
+
+    for (const event of events) {
+      cursor = Math.max(cursor, Number(event.seq || 0));
+      const eventType = String(event.type || "");
+      if (event.accountId) accountId = event.accountId;
+      if (eventType === "account.selected") selectedAccount = event;
+      if (event.threadId) threadId = event.threadId;
+      if (eventType.startsWith("worker.job.")) {
+        if (isTerminalWorkerEvent(event)) terminal = event;
+        continue;
+      }
+      const update = applyCodexStreamEvent(streamState, event);
+      if (update.type === "thread_started") threadId = update.threadId || threadId;
+      if (update.type === "error") throw new Error(update.message);
+    }
+  }
+
+  if (terminal?.type === "worker.job.failed") throw restoreLocalizedError(terminal, "errors.workerFailed");
+  if (terminal?.type === "worker.job.cancelled") throw restoreLocalizedError(terminal, "errors.workerCancelled");
+  if (terminal?.status !== "completed" && terminal?.type !== "worker.job.completed") {
+    throw new Error(`Worker job ${jobId} did not complete successfully.`);
+  }
+  return {
+    turn: codexStreamResult(streamState),
+    threadId,
+    ...(accountId ? { accountId, selectedAccount } : {}),
+    workerLastSeq: cursor
+  };
+}
+
+export function isTerminalWorkerEvent(event) {
+  return event?.type === "worker.job.completed"
+    || event?.type === "worker.job.failed"
+    || event?.type === "worker.job.cancelled";
+}
+
+export function isTerminalWorkerStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+export function isWorkerRestartFailure(value) {
+  const reason = String(value?.reason ?? value?.failureReason ?? value?.code ?? "");
+  if (reason === WORKER_RESTART_FAILURE_REASON) return true;
+  const message = value instanceof Error
+    ? value.message
+    : typeof value === "string"
+      ? value
+      : value?.message ?? value?.error ?? "";
+  return String(message).trim().toLowerCase() === WORKER_RESTART_FAILURE_MESSAGE;
+}

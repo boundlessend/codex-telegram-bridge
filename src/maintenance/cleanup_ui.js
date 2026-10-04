@@ -1,0 +1,133 @@
+import { createMessageFormatter } from "../i18n.js";
+import { b, code } from "../telegram/html.js";
+import { createNavigationKeyboardViews } from "../ui/keyboard_helpers.js";
+
+export function createCleanupUi({ telegram, localization, formatting }) {
+  const msg = createMessageFormatter(localization.text);
+  const navigation = createNavigationKeyboardViews({ text: localization.text });
+  const withBack = (keyboard) => navigation.withMenuCloseButton(navigation.withPreviousPanelButton(keyboard, "tools"));
+  async function editCleanupMessage(ctx, html) {
+    return telegram.editOrReplyHtml(ctx, html, withBack());
+  }
+
+  async function editUploadCleanupMessage(ctx, html) {
+    return telegram.editOrReplyHtml(ctx, html, withBack());
+  }
+
+  async function editCleanupProcessingMessage(ctx, action, plan) {
+    return telegram.editOrReplyHtml(ctx, formatCleanupProcessingHtml(action, plan), withBack({
+      reply_markup: {
+        inline_keyboard: [[{
+          text: localization.text("cleanupProcessingButton"),
+          callback_data: `cleanup:processing:${plan.id}`
+        }]]
+      }
+    }));
+  }
+
+  function cleanupActionLabel(action) {
+    if (action === "quarantine") return localization.text("cleanupActionQuarantine");
+    if (action === "delete") return localization.text("cleanupActionDelete");
+    if (action === "both") return localization.text("cleanupActionBoth");
+    if (action === "ignore") return localization.text("cleanupActionIgnore");
+    return action;
+  }
+
+  function cleanupCallbackText(action) {
+    if (action === "quarantine") return localization.text("cleanupCallbackQuarantine");
+    if (action === "delete") return localization.text("cleanupCallbackDelete");
+    if (action === "both") return localization.text("cleanupCallbackBoth");
+    if (action === "ignore") return localization.text("cleanupCallbackIgnore");
+    if (action === "missing") return localization.text("cleanupCallbackMissing");
+    if (action === "expired") return localization.text("cleanupCallbackExpired");
+    return "";
+  }
+
+  async function answerCleanupCallback(ctx, action) {
+    try {
+      await ctx.answerCbQuery(cleanupCallbackText(action));
+    } catch (error) {
+      console.warn("cleanup callback answer failed:", telegram.summarizeError(error));
+    }
+  }
+
+  async function answerUploadCleanupCallback(ctx, status) {
+    const text = status === "confirm"
+      ? msg("ui.uploadDeleting")
+      : status === "expired_plan"
+        ? msg("ui.uploadExpired")
+        : status === "processing"
+          ? msg("ui.uploadProcessing")
+          : msg("ui.uploadMissing");
+    try {
+      await ctx.answerCbQuery(text);
+    } catch (error) {
+      console.warn("upload cleanup callback answer failed:", telegram.summarizeError(error));
+    }
+  }
+
+  function formatCleanupProcessingHtml(action, plan) {
+    return [
+      b(localization.formatText("cleanupProcessingTitle", {
+        action: cleanupActionLabel(action)
+      })),
+      "",
+      localization.text("cleanupProcessingBody"),
+      "",
+      b(localization.text("cleanupTargets")),
+      `- ${localization.text("cleanupQuarantineCandidates")}: ${code(formatting.count(plan.quarantineCandidates.length))}`,
+      `- ${localization.text("cleanupPermanentDeleteCandidates")}: ${code(formatting.count(plan.deleteCandidates.length))}`,
+      "",
+      localization.text("cleanupFinishReplace")
+    ].join("\n");
+  }
+
+  function formatCleanupIgnoredHtml(plan) {
+    return [
+      b(localization.text("cleanupIgnoredTitle")),
+      "",
+      `${localization.text("cleanupQuarantineCandidates")}: ${code(formatting.count(plan.quarantineCandidates.length))}`,
+      `${localization.text("cleanupPermanentDeleteCandidates")}: ${code(formatting.count(plan.deleteCandidates.length))}`,
+      "",
+      localization.text("cleanupNoFilesMoved")
+    ].join("\n");
+  }
+
+  function formatCleanupResultHtml(action, result, plan = null) {
+    const lines = [
+      b(localization.formatText("cleanupResultTitle", { action: cleanupActionLabel(action) })),
+      "",
+      `${localization.text("cleanupResultQuarantined")}: ${code(result.quarantined)}`,
+      `${localization.text("cleanupResultDeleted")}: ${code(result.deleted)}`,
+      `${localization.text("cleanupResultSkipped")}: ${code(result.skipped)}`,
+      `${localization.text("cleanupResultErrors")}: ${code(result.errors.length)}`,
+      msg("ui.manifestLine", { value1: code(result.manifest || msg("ui.none")) }),
+      msg("ui.restoreLine", { value1: code(result.restoreScript || msg("ui.none")) })
+    ];
+    if (result.deleted > 0) {
+      lines.push("", localization.text("cleanupPermanentDeletionNotice"));
+    }
+    if (plan) {
+      lines.push(
+        "",
+        b(localization.text("cleanupTargetSummary")),
+        `- ${localization.text("cleanupQuarantineCandidates")}: ${code(formatting.count(plan.quarantineCandidates.length))}`,
+        `- ${localization.text("cleanupPermanentDeleteCandidates")}: ${code(formatting.count(plan.deleteCandidates.length))}`
+      );
+    }
+    if (result.errors.length > 0) {
+      lines.push("", ...result.errors.slice(0, 3).map((error) => `- ${code(error)}`));
+    }
+    return lines.join("\n");
+  }
+
+  return {
+    answerCleanupCallback,
+    answerUploadCleanupCallback,
+    editCleanupMessage,
+    editCleanupProcessingMessage,
+    editUploadCleanupMessage,
+    formatCleanupIgnoredHtml,
+    formatCleanupResultHtml
+  };
+}

@@ -1,0 +1,15 @@
+node_modules/
+coverage/
+.env
+/state/
+AGENTS.md
+.codegraph/
+npm-debug.log*
+*.log
+*.swp
+.*.swp
+
+__pycache__/
+*.pyc
+*.bak
+*.tgz

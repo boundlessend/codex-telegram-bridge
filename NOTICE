@@ -1,0 +1,24 @@
+codex-telegram-bridge
+
+Original bridge additions, the portable runtime, metadata cleaner and companion
+skill are licensed under BSD-3-Clause; see LICENSE.
+
+This project incorporates and modifies code from:
+https://github.com/woosungchoi/codex-telegram-bot
+Imported upstream base: 0f2febd6a49c3920d91dc8d0739ec0d5657b92a3
+Copyright (c) 2026 Codex Telegram Bot contributors
+The upstream code remains subject to MIT; see LICENSES/MIT-upstream.txt.
+Existing src, bin, scripts, test, docs and config files derive from that base,
+except new additions identified below. Original changes in derived files carry
+the BSD terms in addition to the retained MIT notice. Distribute both notices.
+
+New additions: runtime/, skills/, scripts/clean-metadata.py,
+scripts/sdk-smoke.mjs, src/fs/instance_lock.js,
+src/maintenance/local_retention.js, src/runtime/service_commands.js,
+src/telegram/file_hygiene.js, test/helpers/canonical_tmp.mjs,
+test/telegram_hardening.test.mjs, test/portable_runtime.test.mjs.
+
+No code from the separately installed remove-ai-marks skill is bundled.
+exiftool and qpdf are system tools, installed separately under their own
+licenses. Dependency packages retain their respective upstream licenses.
+This is a community project, unaffiliated with OpenAI and Telegram.

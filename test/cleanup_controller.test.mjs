@@ -1,0 +1,441 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createCleanupController } from "../src/maintenance/cleanup_controller.js";
+
+const FIXED_NOW = new Date("2026-07-21T03:04:05.000Z");
+
+function createHarness({ root, sessionScan, deleteCandidates = [], protectedIds = [] }) {
+  const plans = {};
+  const logs = [];
+  const sent = [];
+  const sessionsDir = path.join(root, "sessions");
+  const quarantineDir = path.join(root, "quarantine");
+  const artifactDir = path.join(root, "artifacts");
+  const controller = createCleanupController({
+    stateStore: {
+      plans,
+      prunePlans: () => logs.push({ type: "prune" }),
+      save: async () => logs.push({ type: "save" }),
+      appendLog: async (entry) => logs.push(entry)
+    },
+    policy: {
+      planTtlHours: () => 12,
+      retentionDays: () => 30,
+      quarantineDays: () => 14,
+      artifactDir,
+      sessionsDir,
+      quarantineDir,
+      notifyChatIds: ["101"],
+      maintenanceLogRotateMb: 25,
+      dateKey: () => "20260721"
+    },
+    inventory: {
+      collectProtectedThreadIds: async () => new Set(protectedIds),
+      listSessionFiles: async () => sessionScan ?? {
+        protectedCount: 0,
+        recentCount: 0,
+        candidates: []
+      },
+      listDeleteCandidates: async () => deleteCandidates,
+      readMaintenanceReport: async () => ({
+        ok: true,
+        sessions: { files: 2, bytes: 100 },
+        logs: { bytes: 200, rotateThresholdMb: 50 },
+        staleWorktrees: { candidates: 1 },
+        configPrune: { candidates: 3 },
+        metadataBloat: { titlesOverLimit: 4, previewsOverLimit: 5 }
+      })
+    },
+    telegram: {
+      editOrReplyHtml: async (...args) => sent.push(["edit", ...args]),
+      replyHtml: async (...args) => sent.push(["reply", ...args]),
+      sendHtmlMessage: async (...args) => sent.push(["send", ...args])
+    },
+    formatting: {
+      text: (key) => key,
+      formatText: (key, values) => `${key}:${JSON.stringify(values)}`,
+      formatBytes: (value) => `${value}B`,
+      formatDateTime: (value) => value,
+      formatCount: (value) => String(value),
+      formatResult: (action, result, plan) => JSON.stringify({
+        action,
+        result,
+        quarantineCount: plan.quarantineCandidates.length,
+        deleteCount: plan.deleteCandidates.length
+      })
+    },
+    now: () => new Date(FIXED_NOW),
+    random: () => 0.5
+  });
+  return { artifactDir, controller, logs, plans, quarantineDir, sent, sessionsDir };
+}
+
+async function createFixture(t) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cleanup-controller-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+test("cleanup previews edit callback menus while commands send a new message", async (t) => {
+  const harness = createHarness({ root: await createFixture(t) });
+  const plan = await harness.controller.createCleanupPlan("manual");
+  const command = {}, callback = { callbackQuery: { message: { message_id: 42 } } };
+  await harness.controller.sendCleanupPlan(command, plan);
+  await harness.controller.sendCleanupPlan(callback, plan);
+  assert.deepEqual(harness.sent.map(([method]) => method), ["reply", "edit"]);
+  assert.equal(harness.sent[1][1], callback);
+  assert.equal(harness.sent[0][2], harness.sent[1][2]);
+  assert.deepEqual(harness.sent[0][3], harness.sent[1][3]);
+});
+
+test("cleanup controller creates a deterministic approval plan and renders its controls", async (t) => {
+  const root = await createFixture(t);
+  const candidate = {
+    threadId: "thread-<unsafe>",
+    path: path.join(root, "sessions", "thread.jsonl"),
+    ageDays: 31,
+    bytes: 125
+  };
+  const deletion = {
+    threadId: "old-thread",
+    path: path.join(root, "quarantine", "old.jsonl"),
+    quarantineAgeDays: 15,
+    bytes: 75
+  };
+  const harness = createHarness({
+    root,
+    sessionScan: {
+      protectedCount: 2,
+      recentCount: 3,
+      candidates: [candidate]
+    },
+    deleteCandidates: [deletion]
+  });
+
+  const plan = await harness.controller.createCleanupPlan("manual");
+
+  assert.equal(plan.source, "manual");
+  assert.equal(plan.createdAt, "2026-07-21T03:04:05.000Z");
+  assert.equal(plan.expiresAt, "2026-07-21T15:04:05.000Z");
+  assert.equal(harness.plans[plan.id], plan);
+  assert.deepEqual(harness.logs[0], { type: "prune" });
+  assert.deepEqual(harness.logs[1].summary, {
+    quarantineCount: 1,
+    quarantineBytes: 125,
+    deleteCount: 1,
+    deleteBytes: 75,
+    protectedCount: 2,
+    recentCount: 3
+  });
+
+  const keyboard = harness.controller.cleanupKeyboard(plan.id);
+  assert.deepEqual(
+    keyboard.reply_markup.inline_keyboard.flat().map((button) => button.callback_data),
+    [
+      `cleanup:quarantine:${plan.id}`,
+      `cleanup:delete:${plan.id}`,
+      `cleanup:both:${plan.id}`,
+      `cleanup:ignore:${plan.id}`,
+      "p:tools",
+      "ui:close:menu"
+    ]
+  );
+  const html = harness.controller.formatCleanupPlanHtml(plan);
+  assert.match(html, /thread-&lt;unsafe&gt;/);
+  assert.match(html, /cleanupMaintenanceConfigPruneCandidates/);
+  assert.match(html, /cleanupNoFilesUntilButton/);
+});
+
+test("cleanup controller refuses candidates outside the configured roots", async (t) => {
+  const root = await createFixture(t);
+  const outsideQuarantine = path.join(root, "outside-session.jsonl");
+  const outsideDelete = path.join(root, "outside-delete.jsonl");
+  await fs.writeFile(outsideQuarantine, "session\n");
+  await fs.writeFile(outsideDelete, "delete\n");
+  const harness = createHarness({ root });
+  const plan = {
+    id: "outside-roots",
+    quarantineCandidates: [
+      { threadId: "session", path: outsideQuarantine, ageDays: 40, bytes: 8 }
+    ],
+    deleteCandidates: [
+      { threadId: "delete", path: outsideDelete, quarantineAgeDays: 20, bytes: 7 }
+    ]
+  };
+
+  const result = await harness.controller.applyCleanupPlan(plan, "both");
+
+  assert.equal(result.quarantined, 0);
+  assert.equal(result.deleted, 0);
+  assert.equal(result.errors.length, 2);
+  assert.match(result.errors[0], /outside sessions dir/);
+  assert.match(result.errors[1], /outside quarantine dir/);
+  assert.equal(await fs.readFile(outsideQuarantine, "utf8"), "session\n");
+  assert.equal(await fs.readFile(outsideDelete, "utf8"), "delete\n");
+  assert.equal(await fs.readFile(result.manifest, "utf8"), "");
+});
+
+test("cleanup controller quarantines an eligible session with restore metadata", async (t) => {
+  const root = await createFixture(t);
+  const harness = createHarness({ root });
+  const source = path.join(harness.sessionsDir, "2026", "thread-a.jsonl");
+  await fs.mkdir(path.dirname(source), { recursive: true });
+  await fs.writeFile(source, "session\n");
+  const plan = {
+    id: "quarantine-one",
+    quarantineCandidates: [
+      { threadId: "thread-a", path: source, ageDays: 40, bytes: 8 }
+    ],
+    deleteCandidates: []
+  };
+
+  const result = await harness.controller.applyCleanupPlan(plan, "quarantine");
+  const target = path.join(
+    harness.quarantineDir,
+    "20260721",
+    "sessions",
+    "2026",
+    "thread-a.jsonl"
+  );
+
+  assert.equal(result.quarantined, 1);
+  assert.equal(result.deleted, 0);
+  assert.deepEqual(result.errors, []);
+  await assert.rejects(fs.access(source));
+  assert.equal(await fs.readFile(target, "utf8"), "session\n");
+  assert.deepEqual(JSON.parse(await fs.readFile(`${target}.cleanup.json`, "utf8")), {
+    threadId: "thread-a",
+    originalPath: source,
+    quarantinedAt: "2026-07-21T03:04:05.000Z"
+  });
+  const manifest = JSON.parse((await fs.readFile(result.manifest, "utf8")).trim());
+  assert.deepEqual(manifest, {
+    type: "quarantine",
+    threadId: "thread-a",
+    from: source,
+    to: target
+  });
+});
+
+test("cleanup controller skips sessions that become protected after planning", async (t) => {
+  const root = await createFixture(t);
+  const harness = createHarness({ root, protectedIds: ["thread-active"] });
+  const source = path.join(harness.sessionsDir, "thread-active.jsonl");
+  await fs.mkdir(path.dirname(source), { recursive: true });
+  await fs.writeFile(source, "active\n");
+
+  const result = await harness.controller.applyCleanupPlan({
+    id: "protected",
+    quarantineCandidates: [
+      { threadId: "thread-active", path: source, ageDays: 40, bytes: 7 }
+    ],
+    deleteCandidates: []
+  }, "quarantine");
+
+  assert.equal(result.skipped, 1);
+  assert.equal(result.quarantined, 0);
+  assert.equal(await fs.readFile(source, "utf8"), "active\n");
+});
+
+test("cleanup controller skips planned files that disappear before execution", async (t) => {
+  const root = await createFixture(t);
+  const harness = createHarness({ root });
+  const present = path.join(harness.quarantineDir, "old", "present.jsonl");
+  await fs.mkdir(path.dirname(present), { recursive: true });
+  await fs.writeFile(present, "session\n");
+  await fs.utimes(present, new Date("2026-06-01"), new Date("2026-06-01"));
+  const plan = {
+    id: "stale-files",
+    quarantineCandidates: [{
+      threadId: "missing-quarantine",
+      path: path.join(harness.sessionsDir, "missing.jsonl")
+    }],
+    deleteCandidates: [
+      { threadId: "present", path: present },
+      ...Array.from({ length: 5 }, (_, index) => ({
+        threadId: `missing-delete-${index}`,
+        path: path.join(harness.quarantineDir, "old", `missing-${index}.jsonl`)
+      }))
+    ]
+  };
+
+  const result = await harness.controller.applyCleanupPlan(plan, "both");
+
+  assert.equal(result.quarantined, 0);
+  assert.equal(result.deleted, 1);
+  assert.equal(result.skipped, 6);
+  assert.deepEqual(result.errors, []);
+  assert.equal((await fs.readFile(result.manifest, "utf8")).trim().split("\n").length, 1);
+  await assert.rejects(fs.access(path.join(result.artifactDir, "delete-backup")), { code: "ENOENT" });
+  assert.equal(result.restoreScript, "none");
+  assert.equal(JSON.parse((await fs.readFile(result.manifest, "utf8")).trim()).irreversible, true);
+  await assert.rejects(fs.access(present));
+});
+
+test("automatic daily cleanup runs both actions and sends only the result report", async (t) => {
+  const root = await createFixture(t);
+  const source = path.join(root, "sessions", "thread-auto.jsonl");
+  const deletion = path.join(root, "quarantine", "old", "thread-delete.jsonl");
+  await fs.mkdir(path.dirname(source), { recursive: true });
+  await fs.mkdir(path.dirname(deletion), { recursive: true });
+  await fs.writeFile(source, "session\n");
+  await fs.writeFile(deletion, "delete\n");
+  await fs.utimes(deletion, new Date("2026-06-01"), new Date("2026-06-01"));
+  const harness = createHarness({
+    root,
+    sessionScan: {
+      protectedCount: 3,
+      recentCount: 4,
+      candidates: [{ threadId: "thread-auto", path: source, ageDays: 31, bytes: 8 }]
+    },
+    deleteCandidates: [{
+      threadId: "thread-delete",
+      path: deletion,
+      quarantineAgeDays: 15,
+      bytes: 7
+    }]
+  });
+
+  const run = await harness.controller.runDailyCleanup("both");
+
+  assert.equal(run.ok, true);
+  assert.equal(run.result.quarantined, 1);
+  assert.equal(run.result.deleted, 1);
+  assert.equal(Object.keys(harness.plans).length, 0);
+  assert.equal(harness.sent.length, 1);
+  assert.equal(harness.sent[0][0], "send");
+  assert.equal(harness.sent[0].length, 3);
+  assert.deepEqual(JSON.parse(harness.sent[0][2]), {
+    action: "both",
+    result: run.result,
+    quarantineCount: 1,
+    deleteCount: 1
+  });
+  assert.ok(harness.logs.some((entry) => (
+    entry.type === "apply" && entry.automatic === true && entry.action === "both"
+  )));
+});
+
+test("automatic daily cleanup reports a successful zero-candidate run", async (t) => {
+  const root = await createFixture(t);
+  const harness = createHarness({ root });
+
+  const run = await harness.controller.runDailyCleanup("quarantine");
+
+  assert.equal(run.ok, true);
+  assert.equal(run.result.quarantined, 0);
+  assert.equal(run.result.manifest, "none");
+  assert.equal(harness.sent.length, 1);
+  assert.equal(Object.keys(harness.plans).length, 0);
+});
+
+for (const action of ["quarantine", "delete", "both"]) {
+  test(`${action} handles only its selected file groups without deletion backups`, async (t) => {
+    const root = await createFixture(t);
+    const harness = createHarness({ root });
+    const source = path.join(harness.sessionsDir, "old-session.jsonl");
+    const expired = path.join(harness.quarantineDir, "expired.jsonl");
+    const recent = path.join(harness.quarantineDir, "recent.jsonl");
+    for (const file of [source, expired, recent]) {
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, "session payload\n");
+      await fs.utimes(file, new Date("2026-06-01"), new Date("2026-06-01"));
+    }
+    await fs.writeFile(`${expired}.cleanup.json`, JSON.stringify({ quarantinedAt: "2026-06-01T00:00:00Z" }));
+    await fs.writeFile(`${recent}.cleanup.json`, JSON.stringify({ quarantinedAt: FIXED_NOW.toISOString() }));
+    const newlyQuarantined = path.join(harness.quarantineDir, "20260721", "sessions", "old-session.jsonl");
+    const result = await harness.controller.applyCleanupPlan({
+      id: `selected-${action}`,
+      quarantineCandidates: [{ threadId: "old", path: source }],
+      deleteCandidates: [{ threadId: "expired", path: expired }, { threadId: "recent", path: recent },
+        ...(action === "both" ? [{ threadId: "old", path: newlyQuarantined }] : [])]
+    }, action);
+    const moves = action !== "delete", deletes = action !== "quarantine";
+    assert.equal(result.quarantined, Number(moves));
+    assert.equal(result.deleted, Number(deletes));
+    assert.deepEqual(result.errors, []);
+    assert.equal(await fs.readFile(moves ? newlyQuarantined : source, "utf8"), "session payload\n");
+    assert.equal(await fs.readFile(recent, "utf8"), "session payload\n");
+    if (deletes) {
+      await assert.rejects(fs.access(expired), { code: "ENOENT" });
+      await assert.rejects(fs.access(`${expired}.cleanup.json`), { code: "ENOENT" });
+    } else {
+      assert.equal(await fs.readFile(expired, "utf8"), "session payload\n");
+    }
+    await assert.rejects(fs.access(path.join(result.artifactDir, "delete-backup")), { code: "ENOENT" });
+    assert.equal(result.restoreScript === "none", !moves);
+  });
+}
+
+test("permanent deletion rechecks protection and changed quarantine timestamps", async (t) => {
+  const harness = createHarness({ root: await createFixture(t), protectedIds: ["active"] });
+  const candidates = [];
+  for (const [id, metadata] of [
+    ["active", { quarantinedAt: "2026-06-01T00:00:00Z" }],
+    ["metadata-active", { threadId: "active", quarantinedAt: "2026-06-01T00:00:00Z" }],
+    ["requarantined", { quarantinedAt: FIXED_NOW.toISOString() }],
+    ["invalid-date", { quarantinedAt: "invalid" }]
+  ]) {
+    const file = path.join(harness.quarantineDir, `${id}.jsonl`);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, "keep\n");
+    await fs.writeFile(`${file}.cleanup.json`, JSON.stringify(metadata));
+    candidates.push({ threadId: id, path: file, quarantineAgeDays: 50 });
+  }
+  const result = await harness.controller.applyCleanupPlan({
+    id: "recheck", quarantineCandidates: [], deleteCandidates: candidates
+  }, "delete");
+  assert.equal(result.deleted, 0);
+  assert.equal(result.skipped, 4);
+  assert.deepEqual(result.errors, []);
+  for (const candidate of candidates) assert.equal(await fs.readFile(candidate.path, "utf8"), "keep\n");
+});
+
+test("permanent deletion refuses symlinked files and parent directories", async (t) => {
+  const harness = createHarness({ root: await createFixture(t) });
+  const outside = path.join(harness.sessionsDir, "outside.jsonl");
+  await fs.mkdir(harness.sessionsDir, { recursive: true });
+  await fs.mkdir(harness.quarantineDir, { recursive: true });
+  await fs.writeFile(outside, "keep\n");
+  const link = path.join(harness.quarantineDir, "link.jsonl");
+  const directory = path.join(harness.quarantineDir, "linked-dir");
+  await fs.symlink(outside, link);
+  await fs.symlink(harness.sessionsDir, directory);
+  const result = await harness.controller.applyCleanupPlan({
+    id: "links", quarantineCandidates: [], deleteCandidates: [
+      { threadId: "link", path: link }, { threadId: "parent-link", path: path.join(directory, "outside.jsonl") }
+    ]
+  }, "delete");
+  assert.equal(result.deleted, 0);
+  assert.equal(result.errors.length, 2);
+  assert.equal(await fs.readFile(outside, "utf8"), "keep\n");
+});
+
+test("permanent deletion waits until the full quarantine period has elapsed", async (t) => {
+  const harness = createHarness({ root: await createFixture(t) });
+  const cutoff = FIXED_NOW.getTime() - 14 * 86_400_000;
+  const candidates = [];
+  for (const [id, timestamp] of [["boundary", cutoff], ["expired", cutoff - 1]]) {
+    const file = path.join(harness.quarantineDir, `${id}.jsonl`);
+    await fs.mkdir(harness.quarantineDir, { recursive: true });
+    await fs.writeFile(file, "payload\n");
+    await fs.writeFile(`${file}.cleanup.json`, JSON.stringify({ quarantinedAt: new Date(timestamp).toISOString() }));
+    candidates.push({ threadId: id, path: file });
+  }
+  const result = await harness.controller.applyCleanupPlan({
+    id: "boundary", quarantineCandidates: [], deleteCandidates: candidates
+  }, "delete");
+  assert.equal(result.deleted, 1);
+  assert.equal(result.skipped, 1);
+  assert.equal(await fs.readFile(candidates[0].path, "utf8"), "payload\n");
+  await assert.rejects(fs.access(candidates[1].path), { code: "ENOENT" });
+});
+
+test("unsupported cleanup action cannot create artifacts or change files", async (t) => {
+  const harness = createHarness({ root: await createFixture(t) });
+  await assert.rejects(harness.controller.applyCleanupPlan({ id: "bad" }, "invalid"), /Unsupported cleanup action/);
+  await assert.rejects(fs.access(harness.artifactDir), { code: "ENOENT" });
+});

@@ -1,0 +1,340 @@
+import { textFor } from "../src/i18n.js";
+import test from "node:test";
+import assert from "node:assert/strict";
+import { setImmediate as waitForImmediate } from "node:timers/promises";
+import { createTurnRuntimeController } from "../src/codex/turn_controller.js";
+
+function createHarness({ queueMode = "safe", workerEnabled = false, runTurnError = null, replyError = null, beforeTurn, isAdmissionPaused = () => false } = {}) {
+  const activeTurns = new Map();
+  const pending = new Map();
+  const calls = [];
+  const replies = [];
+  const ctx = {
+    chat: { id: 42 },
+    from: { id: 7 },
+    sendChatAction: async (action) => calls.push(["chat-action", action])
+  };
+  const record = (name, value) => async (...args) => {
+    calls.push([name, ...args]);
+    return value;
+  };
+  const controller = createTurnRuntimeController({
+    settings: {
+      maxPendingTurns: () => 5,
+      pendingTurnMaxAgeSeconds: () => 60,
+      thinkingReaction: "thinking",
+      stoppedReaction: "stopped",
+      errorReaction: "error",
+      completeReaction: "complete"
+    },
+    activeTurns,
+    queue: {
+      createItemId: () => "turn-1",
+      dequeue: async (chatKey) => pending.get(chatKey)?.shift() ?? null,
+      enqueue: async (chatKey, turn) => {
+        const turns = pending.get(chatKey) ?? [];
+        turns.push(turn);
+        pending.set(chatKey, turns);
+        return { ok: true, position: turns.length };
+      },
+      enqueueFront: async (chatKey, turn) => {
+        const turns = pending.get(chatKey) ?? [];
+        turns.unshift(turn);
+        pending.set(chatKey, turns);
+        return { ok: true, position: 1 };
+      },
+      getMode: () => queueMode,
+      getPending: (chatKey) => pending.get(chatKey) ?? [],
+      hasPendingFinalDelivery: () => false,
+      isPaused: () => false,
+      pruneExpired: record("prune"),
+      startDrain: record("drain")
+    },
+    lifecycle: {
+      isAdmissionPaused,
+      isRecoveryActive: () => false,
+      isRestartScheduled: () => false,
+      beforeTurn,
+      onTurnFinished: record("turn-finished")
+    },
+    context: {
+      applyPersonaPrompt: (text) => `persona:${text}`,
+      buildReplyContext: async () => ({ text: "quoted", imagePaths: ["reply.png"] }),
+      ensureTurnContext: (turn) => turn.ctx,
+      getChatKey: () => "chat:42",
+      telegramMessageMeta: () => ({
+        chatType: "private",
+        replyToMessageId: 10,
+        originMessageId: 11,
+        originUpdateId: 12
+      })
+    },
+    codex: {
+      formatTurn: (turn) => turn.finalResponse,
+      getChatThreadId: () => "saved-thread",
+      getOrCreateThread: (...args) => { calls.push(["get-thread", ...args]); return { id: "thread-1" }; },
+      maybeNotifyContextPressure: record("context-pressure"),
+      rememberThread: record("remember-thread"),
+      runTurn: async (...args) => {
+        calls.push(["run-turn", ...args]);
+        if (runTurnError) throw runTurnError;
+        return { finalResponse: "answer" };
+      },
+      startSideThread: () => ({ id: "side-thread" })
+    },
+    worker: {
+      enabled: () => workerEnabled,
+      processPreparedTurn: async () => ({
+        turn: { finalResponse: "worker answer" },
+        threadId: "worker-thread",
+        executionMode: "sidecar",
+        workerJobId: "job-1"
+      })
+    },
+    recovery: {
+      recordActiveTurnCompleted: record("active-completed"),
+      recordActiveTurnFailed: record("active-failed"),
+      recordActiveTurnStarted: record("active-started"),
+      recordTelegramReplyCompleted: record("reply-completed"),
+      recordTelegramReplyFailed: record("reply-failed"),
+      recordTelegramReplyReady: record("reply-ready"),
+      recordTelegramReplyStarted: record("reply-started"),
+      restoreThreadForTurn: record("restore-thread")
+    },
+    progress: {
+      createState: (active) => ({ active, messageIds: [] }),
+      deleteMessages: record("delete-progress"),
+      shouldDelete: (_state, succeeded) => succeeded
+    },
+    telegram: {
+      reactQuietly: record("react"),
+      replyCodexAnswer: async (_ctx, text) => {
+        calls.push(["answer", text]);
+        if (replyError) throw replyError;
+        return { message_id: 99 };
+      },
+      replyHtml: async (_ctx, html) => {
+        replies.push(html);
+        return { message_id: replies.length };
+      }
+    },
+    status: {
+      buildStatusDetails: async () => ({}),
+      formatStatusHtml: () => "status",
+      isStatusQuestion: () => false
+    },
+    sideTurns: {
+      track: (...args) => calls.push(["side-track", ...args]),
+      untrack: (...args) => calls.push(["side-untrack", ...args])
+    },
+    text: (key) => textFor("en", key),
+    now: () => new Date("2026-07-21T05:06:07.000Z"),
+    timers: {
+      setInterval: (callback, delay) => {
+        calls.push(["timer-start", delay, callback]);
+        return 123;
+      },
+      clearInterval: (id) => calls.push(["timer-clear", id])
+    },
+    logger: { warn: (...args) => calls.push(["warn", ...args]) }
+  });
+  return { activeTurns, calls, controller, ctx, pending, replies };
+}
+
+test("failed final send records uncertainty and releases the queue", async () => {
+  const error = Object.assign(new Error("timed out"), { code: "ETIMEDOUT" });
+  const { activeTurns, calls, controller, ctx } = createHarness({ workerEnabled: true, replyError: error });
+  const active = { stopRequested: false };
+  activeTurns.set("chat:42", active);
+  await controller.runPreparedTurnQueue("chat:42", { id: "turn", ctx, text: "work" }, active);
+  assert.equal(activeTurns.has("chat:42"), false);
+  assert.equal(active.deliveryPending, true);
+  assert.equal(calls.some(([name]) => name === "reply-failed"), true);
+  assert.equal(calls.some(([name]) => name === "drain"), true);
+});
+
+test("turn preparation merges reply context, images, routing, and expiry", async () => {
+  const { controller, ctx } = createHarness();
+
+  const turn = await controller.prepareCodexTurn(ctx, "current", async () => ["new.png"]);
+
+  assert.equal(turn.id, "turn-1");
+  assert.equal(turn.chatKey, "chat:42");
+  assert.equal(turn.chatId, 42);
+  assert.equal(turn.replyToMessageId, 10);
+  assert.deepEqual(turn.imagePaths, ["reply.png", "new.png"]);
+  assert.match(turn.inputText, /^persona:Use the following replied-to Telegram message as context\./);
+  assert.match(turn.inputText, /<replied_message>\nquoted/);
+  assert.match(turn.inputText, /<current_message>\ncurrent/);
+  assert.equal(turn.enqueuedAt, "2026-07-21T05:06:07.000Z");
+  assert.equal(turn.expiresAt, "2026-07-21T05:07:07.000Z");
+});
+
+test("an update pause queues even interrupt-mode requests without aborting the active task", async () => {
+  const f = createHarness({ queueMode: "interrupt", isAdmissionPaused: () => true });
+  const abortController = new AbortController();
+  f.activeTurns.set("chat:42", { abortController });
+  await f.controller.handleCodexMessage(f.ctx, "new work", async () => []);
+  assert.equal(abortController.signal.aborted, false);
+  assert.equal(f.pending.get("chat:42").length, 1);
+  assert.equal(f.calls.some(([name]) => name === "run-turn"), false);
+});
+
+test("a turn admitted before update pause is restored to the queue without execution", async () => {
+  const f = createHarness({ isAdmissionPaused: () => true });
+  const active = { stopRequested: false };
+  f.activeTurns.set("chat:42", active);
+  await f.controller.runPreparedTurnQueue("chat:42", { id: "admitted", ctx: f.ctx, text: "work" }, active);
+  assert.equal(f.pending.get("chat:42")[0].id, "admitted");
+  assert.equal(f.activeTurns.size, 0);
+  assert.equal(f.calls.some(([name]) => name === "run-turn"), false);
+});
+
+test("completion observers distinguish successful delivery from a failed turn", async () => {
+  for (const failed of [false, true]) {
+    const { calls, controller, ctx } = createHarness({ runTurnError: failed ? new Error("test failure") : null });
+    const prepared = { id: "scheduled-job", kind: "scheduled", accountId: "default", ctx, text: "check", inputText: "check", imagePaths: [] };
+    await controller.processPreparedTurn("scheduled:task", prepared, { abortController: new AbortController(), stopRequested: false });
+    const event = calls.find(([name]) => name === "turn-finished");
+    assert.equal(event[1], "scheduled:task");
+    assert.equal(event[3].delivered, !failed);
+    assert.equal(event[3].cancelled, false);
+  }
+});
+
+test("routing guards reject queued work before inline or sidecar execution without sending to the old destination", async () => {
+  for (const workerEnabled of [false, true]) {
+    const { calls, controller, ctx, replies } = createHarness({ workerEnabled, beforeTurn: async () => {
+      const error = new Error("The originating bot does not match"); error.suppressTelegramReply = true; throw error;
+    } });
+    await controller.processPreparedTurn("-100123:topic:40", { id: "forum-job", kind: "forum", ctx, text: "check", inputText: "check", imagePaths: [] }, { abortController: new AbortController() });
+    assert.equal(calls.some(([name]) => name === "run-turn" || name === "reply-ready"), false);
+    assert.equal(replies.length, 0);
+    assert.equal(calls.find(([name]) => name === "turn-finished")[3].delivered, false);
+  }
+});
+
+test("inline forum work uses the captured account and its project session", async () => {
+  const { calls, controller, ctx } = createHarness();
+  await controller.processPreparedTurn("-100123:topic:40", { id: "forum-job", kind: "forum", accountId: "project-account", ctx, text: "check", inputText: "check", imagePaths: [] }, { abortController: new AbortController() });
+  assert.deepEqual(calls.find(([name]) => name === "get-thread")[2], { accountId: "project-account", threadId: "saved-thread" });
+});
+
+test("safe mode queues a new message behind an active turn", async () => {
+  const { activeTurns, controller, ctx, pending, replies } = createHarness();
+  activeTurns.set("chat:42", { abortController: new AbortController() });
+
+  await controller.handleCodexMessage(ctx, "queued", async () => []);
+
+  assert.equal(pending.get("chat:42").length, 1);
+  assert.equal(pending.get("chat:42")[0].text, "queued");
+  assert.match(replies.at(-1), /Queued Codex turn/);
+  assert.match(replies.at(-1), /#1/);
+});
+
+test("interrupt mode prepends work and aborts the active turn", async () => {
+  const { activeTurns, controller, ctx, pending, replies } = createHarness({
+    queueMode: "interrupt"
+  });
+  const abortController = new AbortController();
+  const active = { abortController };
+  activeTurns.set("chat:42", active);
+
+  await controller.handleCodexMessage(ctx, "interrupt", async () => []);
+
+  assert.equal(pending.get("chat:42")[0].text, "interrupt");
+  assert.equal(active.interruptRequested, true);
+  assert.equal(abortController.signal.aborted, true);
+  assert.ok(replies.at(-1).includes(textFor("en", "interruptRequestedTitle")));
+});
+
+test("side mode runs an isolated thread without queueing the message", async () => {
+  const { activeTurns, calls, controller, ctx, pending, replies } = createHarness({
+    queueMode: "side"
+  });
+  activeTurns.set("chat:42", { abortController: new AbortController() });
+
+  await controller.handleCodexMessage(ctx, "side question", async () => []);
+  await waitForImmediate();
+
+  assert.equal(pending.has("chat:42"), false);
+  assert.ok(replies[0].includes(textFor("en", "sideTurnStartedTitle")));
+  assert.match(replies[1], /Side reply/);
+  assert.equal(calls.filter(([name]) => name === "side-track").length, 1);
+  assert.equal(calls.filter(([name]) => name === "side-untrack").length, 1);
+});
+
+test("prepared inline turns preserve recovery and final-delivery ordering", async () => {
+  const { calls, controller, ctx } = createHarness();
+  const active = {
+    abortController: new AbortController(),
+    stopRequested: false
+  };
+  const preparedTurn = {
+    id: "turn-1",
+    ctx,
+    kind: "user",
+    text: "question",
+    inputText: "prompt",
+    imagePaths: ["image.png"]
+  };
+
+  await controller.processPreparedTurn("chat:42", preparedTurn, active);
+
+  assert.equal(active.currentTurnStartedAt, "2026-07-21T05:06:07.000Z");
+  assert.equal(active.currentPreparedTurn, preparedTurn);
+  const names = calls.map(([name]) => name);
+  assert.ok(names.indexOf("restore-thread") < names.indexOf("active-started"));
+  assert.ok(names.indexOf("active-started") < names.indexOf("run-turn"));
+  assert.ok(names.indexOf("reply-ready") < names.indexOf("reply-started"));
+  assert.ok(names.indexOf("reply-started") < names.indexOf("answer"));
+  assert.ok(names.indexOf("answer") < names.indexOf("reply-completed"));
+  assert.ok(names.indexOf("reply-completed") < names.indexOf("active-completed"));
+  assert.ok(names.indexOf("delete-progress") < names.indexOf("active-completed"));
+  assert.equal(calls.find(([name]) => name === "context-pressure")[4], calls.find(([name]) => name === "delete-progress")[2]);
+  assert.equal(calls.find(([name]) => name === "answer")[1], "answer");
+  assert.equal(calls.filter(([name]) => name === "delete-progress").length, 1);
+  assert.deepEqual(calls.filter(([name]) => name === "react").at(-1).slice(1), [
+    ctx,
+    "complete",
+    true
+  ]);
+});
+
+test("bad request failures include image-safe new-thread recovery guidance", async () => {
+  const { calls, controller, ctx, replies } = createHarness({
+    runTurnError: new Error('{"detail":"Bad Request"}')
+  });
+  const active = {
+    abortController: new AbortController(),
+    stopRequested: false
+  };
+  const preparedTurn = {
+    id: "turn-1",
+    ctx,
+    kind: "user",
+    text: "inspect images",
+    inputText: "prompt",
+    imagePaths: []
+  };
+
+  await controller.processPreparedTurn("chat:42", preparedTurn, active);
+
+  assert.match(replies.at(-1), /<b>Codex failed<\/b>/);
+  assert.match(replies.at(-1), /\{&quot;detail&quot;:&quot;Bad Request&quot;\}/);
+  assert.ok(replies.at(-1).includes(textFor("en", "codexBadRequestRecoveryDetail")));
+  assert.equal(calls.filter(([name]) => name === "run-turn").length, 1);
+  assert.deepEqual(calls.find(([name]) => name === "active-failed").slice(1), [
+    "chat:42",
+    '{"detail":"Bad Request"}'
+  ]);
+  assert.equal(calls.some(([name]) => name === "answer"), false);
+});
+
+test("side prompt explicitly prevents writes while the main turn continues", () => {
+  const { controller } = createHarness();
+  const prompt = controller.applySideThreadPrompt("status?");
+  assert.match(prompt, /side reply/);
+  assert.match(prompt, /Avoid file changes or write commands/);
+  assert.match(prompt, /status\?$/);
+});

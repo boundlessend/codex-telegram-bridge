@@ -119,8 +119,8 @@ export function createRuntimeDiagnosticsCollectors({
   async function collectHealthRows() {
     const config = settings.config;
     const memory = process.memoryUsage();
-    const botProbe = serviceStatusCommand("bot", process.platform, process.getuid?.());
-    const workerProbe = serviceStatusCommand("worker", process.platform, process.getuid?.());
+    const botProbe = serviceStatusCommand("bot", process.platform, process.getuid?.(), config.codexUpdateBotService);
+    const workerProbe = serviceStatusCommand("worker", process.platform, process.getuid?.(), config.codexUpdateWorkerService);
     const [
       stateCheck,
       backupCheck,

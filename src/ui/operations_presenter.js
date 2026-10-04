@@ -151,7 +151,7 @@ export function createOperationsPresenter({
     }
     const result = await commands.readOutput(
       "journalctl",
-      ["--user", "-u", "codex-telegram-bot.service", ...priorityArgs, "-n", String(lines), "--no-pager"],
+      ["--user", "-u", settings.config.codexUpdateBotService, ...priorityArgs, "-n", String(lines), "--no-pager"],
       5000
     );
     if (!result.ok) return `${b(msg("ui.logsUnavailable"))}\n${code(result.error)}`;

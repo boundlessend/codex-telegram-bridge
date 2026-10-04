@@ -1,0 +1,30 @@
+#!/usr/bin/env node
+import process from "node:process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const [action = "setup", ...args] = process.argv.slice(2);
+const actions = new Set(["setup", "doctor", "status", "start", "stop", "restart", "uninstall"]);
+if (action === "--help" || action === "-h") {
+  console.log("Usage: codex-telegram-bridge [setup [--workdir PATH]|doctor|status|start|stop|restart|uninstall]");
+} else if (!actions.has(action)) {
+  console.error("Unknown bridge action. Use --help.");
+  process.exitCode = 2;
+} else {
+  const python = process.env.CODEX_TELEGRAM_PYTHON || "python3";
+  const checked = spawnSync(python, ["-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"], { stdio: "ignore", timeout: 10_000 });
+  if (checked.status !== 0) {
+    console.error("Python 3.10+ is required. Install Python and rerun bridge setup.");
+    process.exitCode = 2;
+  } else {
+    const script = action === "setup" ? "setup.py" : "manage.py";
+    const parameters = action === "setup" ? args : [action, ...args];
+    const child = spawn(python, [path.join(root, "runtime", script), ...parameters], {
+      stdio: "inherit", env: { ...process.env, CODEX_TELEGRAM_NODE: process.execPath }
+    });
+    child.once("error", () => { console.error("Could not launch the local bridge manager."); process.exitCode = 2; });
+    child.once("exit", (code) => { process.exitCode = Number.isInteger(code) ? code : 2; });
+  }
+}

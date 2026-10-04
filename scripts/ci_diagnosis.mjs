@@ -84,7 +84,7 @@ const CLASSIFIERS = [
     ],
     recommendedCommands: [
       "npm run format:check",
-      "npx prettier --write package.json package-lock.json .github/workflows/*.yml",
+      "npx prettier --write package.json npm-shrinkwrap.json .github/workflows/*.yml",
     ],
   },
   {

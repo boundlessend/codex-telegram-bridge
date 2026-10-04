@@ -1,87 +1,66 @@
 #!/usr/bin/env python3
-"""Inspect and control this installation's macOS LaunchAgents."""
+"""Inspect or control the permanent bridge on macOS and Linux."""
 from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 
-from runtime import BOT_ROOT, STATE_ROOT, RuntimeConfigurationError, read_settings
-
-
-LABELS = ("local.codex.telegram.bridge.worker", "local.codex.telegram.bridge.bot")
-
-
-def service_loaded(label: str) -> bool:
-    result = subprocess.run(["launchctl", "print", "gui/" + str(os.getuid()) + "/" + label], capture_output=True, text=True, timeout=10)
-    if result.returncode == 0:
-        return True
-    if "Could not find service" in result.stderr:
-        return False
-    raise RuntimeConfigurationError("LaunchAgent lookup failed: exit_code=" + str(result.returncode))
-
-
-def start_services() -> None:
-    for label in LABELS:
-        if service_loaded(label):
-            continue
-        plist = Path.home() / "Library/LaunchAgents" / (label + ".plist")
-        if not plist.is_file():
-            raise RuntimeConfigurationError("Run runtime/setup.py before starting services")
-        subprocess.run(["launchctl", "bootstrap", "gui/" + str(os.getuid()), str(plist)], check=True, timeout=15)
-
-
-def stop_services() -> None:
-    for label in reversed(LABELS):
-        if service_loaded(label):
-            subprocess.run(["launchctl", "bootout", "gui/" + str(os.getuid()) + "/" + label], check=True, timeout=15)
-
-
-def restart_services() -> None:
-    stop_services()
-    start_services()
+from runtime import BOT_ROOT, STATE_ROOT, RuntimeConfigurationError, installed_root, read_settings
+from services import ROLES, ServiceManager
 
 
 def doctor() -> bool:
-    tools = {name: shutil.which(name) is not None for name in ("node", "codex", "exiftool", "qpdf")}
-    settings_ready = False
+    settings: dict[str, str] = {}
     if (STATE_ROOT / "settings.json").is_file():
         settings = read_settings()
-        settings_ready = all(name in settings for name in ("CODEX_TELEGRAM_NODE", "CODEX_WORKDIR", "ALLOWED_USER_IDS"))
+    tools = {name: shutil.which(name) is not None for name in ("node", "codex", "exiftool", "qpdf")}
+    for name, key in [("node", "CODEX_TELEGRAM_NODE"), ("codex", "CODEX_PATH")]:
+        if settings.get(key):
+            tools[name] = Path(settings[key]).is_file()
+    root = BOT_ROOT
+    settings_ready = all(key in settings for key in ("CODEX_TELEGRAM_APP_ROOT", "CODEX_TELEGRAM_NODE", "CODEX_WORKDIR", "ALLOWED_USER_IDS"))
+    if settings_ready:
+        root = installed_root(settings)
+    dependencies = (root / "node_modules/@openai/codex-sdk").is_dir()
     report: dict[str, object] = {
         "macos_runtime_supported": sys.platform == "darwin",
-        "tools": tools,
-        "dependencies_installed": (BOT_ROOT / "node_modules/@openai/codex-sdk").is_dir(),
-        "settings_ready": settings_ready,
-        "credentials_checked": False,
+        "platform_supported": sys.platform in {"darwin", "linux"}, "tools": tools,
+        "dependencies_installed": dependencies, "settings_ready": settings_ready,
+        "credentials_checked": False, "optional_file_tools_ready": tools["exiftool"] and tools["qpdf"]
     }
     print(json.dumps(report))
-    return all(tools.values()) and bool(report["dependencies_installed"]) and settings_ready
+    return bool(report["platform_supported"]) and tools["node"] and tools["codex"] and dependencies and settings_ready
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("doctor", "status", "start", "stop", "restart"))
+    parser.add_argument("action", choices=("doctor", "status", "start", "stop", "restart", "uninstall"))
     args = parser.parse_args()
     if args.action == "doctor":
         if not doctor():
             raise SystemExit(1)
         return
-    if sys.platform != "darwin":
-        raise RuntimeConfigurationError("This manager requires macOS; use systemctl on Linux")
+    manager = ServiceManager(sys.platform, Path.home())
     if args.action == "status":
-        print(json.dumps({label: service_loaded(label) for label in LABELS}))
+        print(json.dumps({role: manager.state(role) for role in ROLES}))
     elif args.action == "start":
-        start_services()
+        manager.start()
     elif args.action == "stop":
-        stop_services()
+        manager.stop()
     elif args.action == "restart":
-        restart_services()
+        manager.stop()
+        manager.start()
+    elif args.action == "uninstall":
+        manager.unregister(read_settings())
+        print("Bridge user services unregistered. Local settings, credentials and history are retained")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeConfigurationError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(2) from None

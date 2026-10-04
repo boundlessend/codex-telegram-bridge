@@ -23,7 +23,7 @@ async function lineCount(path) {
 test("independent distribution preserves attribution and excludes private screenshots", async () => {
   const pkg = await readJson("package.json");
   assert.equal(pkg.name, "codex-telegram-bridge");
-  assert.equal(pkg.version, "0.1.0");
+  assert.equal(pkg.version, "0.2.0");
   assert.equal(pkg.license, "BSD-3-Clause AND MIT");
   assert.equal(pkg.private, true);
   assert.equal(pkg.repository?.url, "git+https://github.com/boundlessend/codex-telegram-bridge.git");

@@ -1,9 +1,9 @@
 import path from "node:path";
 import os from "node:os";
 
-export function serviceStatusCommand(service, platform, uid) {
+export function serviceStatusCommand(service, platform, uid, unitName) {
   if (platform === "darwin") return { command: "launchctl", args: ["print", `gui/${uid}/local.codex.telegram.bridge.${service}`] };
-  return { command: "systemctl", args: ["--user", "is-active", `codex-telegram-${service}.service`] };
+  return { command: "systemctl", args: ["--user", "is-active", unitName] };
 }
 
 export function recoveryServiceChecks(serviceName, platform, uid) {

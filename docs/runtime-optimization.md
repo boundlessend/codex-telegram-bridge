@@ -34,9 +34,11 @@ overwrite the last valid file. The state schema version remains 1.
 
 ## Worker archives
 
-`CODEX_WORKER_LOG_RETENTION_DAYS=30` enables hourly archival, starting one minute
-after worker startup. `0` disables the automatic schedule. Each run archives at
-most 20 files. The default CLI operation is a read-only preview:
+`CODEX_WORKER_LOG_RETENTION_DAYS=30` enables hourly history maintenance, starting
+one minute after worker startup. It prunes eligible terminal jobs before
+archiving remaining eligible logs, at most 20 per pass. Scheduled passes do not
+overlap, and shutdown waits for a running pass. `0` disables the automatic
+schedule. The default CLI operation is a read-only preview:
 
 ```bash
 node scripts/worker-log-maintenance.mjs --dry-run
@@ -62,9 +64,11 @@ Eligible logs are streamed into private gzip files in the worker `archives/`
 directory, decompressed and SHA-256 checked, then published atomically. The
 original is removed only after another identity/protection check. Job metadata
 retains the archive location and digest; the same worker event API can replay the
-archive and validates its digest. Archived job IDs cannot be reused. Archives
-and job metadata have no automatic deletion policy. Back up the whole worker
-state directory, including `jobs/` and `archives/`.
+archive and validates its digest. Archived job IDs cannot be reused while their
+metadata exists. Scheduled retention removes old completed, failed or cancelled
+job records and their events/archives only when the protection checks permit it;
+completed jobs also need a confirmed receipt. Backup the whole worker state
+directory, including `jobs/` and `archives/`, before maintenance or deployment.
 
 For rollout, merge verified changes before restarting the bot. Let current jobs
 finish before restarting the worker; the bot and worker have separate lifecycles.

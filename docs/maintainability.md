@@ -45,9 +45,10 @@ placeholders. Add the same key and placeholders to every locale.
 ## Verification
 
 - `npm run verify`: syntax, locales, lint, formatting, type boundaries,
-  architecture, tests and the repository's dependency audit policy.
-- `npm run test:coverage` (Node 22+): integration coverage, LCOV and
-  `coverage/summary.json`. CI uses Node 24 and uploads the artifacts. Unreported
+  architecture and tests. Dependency auditing runs separately as `npm run audit:ci`.
+- `npm run test:coverage` (Node 24): local integration coverage, LCOV and
+  `coverage/summary.json`. CI runs verification on Linux and macOS without a
+  coverage artifact upload. Unreported
   source files are listed separately, so a percentage cannot hide untested
   entrypoints. Both composition modules must have executed lines.
 - `test/runtime_routes_integration.test.mjs`: real Telegraf middleware and route

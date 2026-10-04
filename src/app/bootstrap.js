@@ -1,7 +1,6 @@
-import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { acquireInstanceLock } from "../fs/instance_lock.js";
+import { acquireInstanceLock, telegramInstanceLockPath } from "../fs/instance_lock.js";
 import { ensurePrivateDirectory } from "../fs/private.js";
 
 export async function bootstrapBot({
@@ -18,10 +17,9 @@ export async function bootstrapBot({
   processRef = process,
   logger = console
 }) {
-  const lockRoot = path.join(os.homedir(), process.platform === "darwin" ? "Library/Application Support/CodexTelegram/locks" : ".local/state/codex-telegram/locks");
-  await ensurePrivateDirectory(lockRoot);
-  const identity = createHash("sha256").update(config.telegramBotToken).digest("hex").slice(0, 24);
-  const releaseLock = await acquireInstanceLock(path.join(lockRoot, `${identity}.lock`));
+  const lockFile = telegramInstanceLockPath(config.telegramBotToken, os.homedir(), process.platform);
+  await ensurePrivateDirectory(path.dirname(lockFile));
+  const releaseLock = await acquireInstanceLock(lockFile);
   let stopping = false;
   let launched = false;
   let cancelQueueStartup = () => {};

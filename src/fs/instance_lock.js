@@ -1,10 +1,19 @@
 import fs from "node:fs/promises";
 import net from "node:net";
-import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
+
+export function telegramInstanceLockPath(token, home, platform) {
+  const root = platform === "darwin"
+    ? "Library/Application Support/CodexTelegram/locks"
+    : ".local/state/codex-telegram/locks";
+  const identity = createHash("sha256").update(token).digest("hex").slice(0, 24);
+  return path.join(home, root, `${identity}.lock`);
+}
 
 async function bootIdentity() {
   if (process.platform === "darwin") {

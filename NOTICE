@@ -12,7 +12,9 @@ Existing src, bin, scripts, test, docs and config files derive from that base,
 except new additions identified below. Original changes in derived files carry
 the BSD terms in addition to the retained MIT notice. Distribute both notices.
 
-New additions: runtime/, skills/, docs/setup.md, scripts/clean-metadata.py,
+New additions: runtime/, skills/, docs/setup.md, plugin.json,
+bin/codex-telegram-bridge, scripts/pair-telegram.mjs, src/telegram/pairing.js,
+test/telegram_pairing.test.mjs, test/unified_setup.test.mjs, scripts/clean-metadata.py,
 scripts/sdk-smoke.mjs, src/fs/instance_lock.js,
 src/maintenance/local_retention.js, src/runtime/service_commands.js,
 src/telegram/file_hygiene.js, test/helpers/canonical_tmp.mjs,

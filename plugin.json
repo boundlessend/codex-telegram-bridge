@@ -1,0 +1,25 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codex-telegram-bridge",
+  "version": "0.2.0",
+  "description": "Set up and maintain a local Telegram bridge for Codex with secure account pairing",
+  "author": {
+    "name": "boundlessend",
+    "url": "https://github.com/boundlessend"
+  },
+  "homepage": "https://github.com/boundlessend/codex-telegram-bridge",
+  "repository": "https://github.com/boundlessend/codex-telegram-bridge",
+  "license": "BSD-3-Clause AND MIT",
+  "keywords": ["codex", "telegram", "self-hosted"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Codex Telegram Bridge",
+        "shortDescription": "Pair Telegram and manage your local Codex bridge",
+        "defaultPrompt": [
+          "Use $codex-telegram-bridge to help me set up or inspect my Telegram bridge."
+        ]
+      }
+    }
+  }
+}

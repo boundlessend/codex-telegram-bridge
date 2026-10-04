@@ -1,97 +1,84 @@
 # Setup and configuration
 
-Start with the installation commands in README.md. Keep Node.js 24 active in
-PATH, including for background services. The local Codex CLI comes from `npm ci`;
-`npm ci --omit=dev` does not install it. Authenticate locally with `codex login`.
-Create the bot through BotFather and obtain your numeric Telegram user ID
-before setup, for example with [userinfobot](https://t.me/userinfobot).
-Usernames are not accepted in allowlists.
+Run the one-command wizard from README.md in your own interactive terminal.
+Token and pairing-link input must stay out of Codex conversations and logs.
+The wizard supports macOS and Linux, checks Node.js 24/Python 3.10+, installs
+locked production dependencies and reuses a verified installation on repeat runs.
+It never changes global Codex configuration.
 
-## macOS
+## Local wizard
 
-With Homebrew, install the system prerequisites:
+1. Choose an existing trusted Git project directory.
+2. Complete Codex login locally if its status check requires it.
+3. Enter your bot token into the hidden prompt.
+4. Open the displayed one-time Telegram link within five minutes. Only a fresh,
+   direct private message with that challenge can bind the owner. Webhook bots
+   and a second local polling instance are refused.
+5. After the read-only Codex check, choose whether to enable login autostart.
+
+For updates, stop the bridge before rerunning setup. An empty token prompt reuses
+its saved credential and existing owner binding. A different bot or owner needs
+a separate runtime directory so private history cannot move to another account.
+
+Runtime paths:
+
+| Platform | Private runtime directory | Credentials | Services |
+| --- | --- | --- | --- |
+| macOS | `~/Library/Application Support/CodexTelegramBridge/` | Keychain service `codex-telegram-bridge` | `local.codex.telegram.bridge.bot/worker` |
+| Linux | `$XDG_STATE_HOME/codex-telegram-bridge/` or `~/.local/state/codex-telegram-bridge/` | Owner-only `telegram.token`, mode `600` | `codex-telegram-bridge-bot/worker.service` |
+
+`apps/` holds verified runtime copies, `settings.json` contains string settings,
+`state/` contains private history and `worker.sock` is the worker connection.
+`CODEX_TELEGRAM_RUNTIME_DIR` selects an explicit absolute runtime directory.
+Old runtime copies remain available for rollback.
+
+On macOS, system prerequisites can be installed with Homebrew:
 
 ```sh
 brew install node@24 python exiftool qpdf
 export PATH="$(brew --prefix node@24)/bin:$PATH"
 ```
 
-Run `runtime/setup.py --workdir PROJECT` from the checkout. The chosen project
-must already be a Git repository unless you deliberately configure
-`CODEX_SKIP_GIT_REPO_CHECK=true` locally. Setup validates Telegram and Codex before
-changing settings or credentials. It leaves global Codex configuration intact.
+On Linux, install Node.js 24/Python through your preferred package manager and
+ensure a systemd user session is available. File-cleaning tools are optional
+for text-only use. The wizard reports missing required prerequisites before
+requesting the token; it does not install system-wide software silently.
 
-The Keychain service is `codex-telegram-bridge`. Runtime settings, logs and state
-live in `~/Library/Application Support/CodexTelegramBridge/`. Settings are string
-environment values in `settings.json`; the bot token is stored only in Keychain.
-Stop services before editing settings, then start them again:
+## Service control
 
-```sh
-python3 runtime/manage.py stop
-python3 runtime/manage.py start
-```
+Use `codex-telegram-bridge doctor|status|start|stop|restart|uninstall` through the
+README's `npx` prefix, or `node bin/codex-telegram-bridge ACTION` from a checkout.
+`python3 runtime/manage.py ACTION` is also available.
 
-Use `doctor` for prerequisites and `status` for LaunchAgent registration.
-Neither proves end-to-end Telegram delivery. Service labels are
-`local.codex.telegram.bridge.worker` and `local.codex.telegram.bridge.bot`.
-Moving the checkout or Python executable requires rerunning setup to update them.
+Doctor checks prerequisites without retrieving the Telegram token. Status checks
+native service state; neither proves Telegram delivery. Start a small task from
+the paired Telegram account for that check. Uninstall unregisters only owned
+bridge services and retains credentials and history. Plugin removal alone
+removes its skill/cache; it does not unregister the independent daemon.
 
-## Linux configuration
+## Advanced settings
 
-Edit the copied `.env` locally. Required values are the token, numeric user ID
-and absolute working/state directories. `CODEX_PATH` may point to your chosen
-CLI; if it is outside the service PATH, use its absolute executable path.
-dotenv does not expand shell variables such as `$HOME` in these values.
+Stop services before editing `settings.json`, then start them again. Options are
+documented in `.env.example`; the managed wizard uses private JSON settings
+instead of dotenv. Interface languages are English, Korean, Russian and
+Traditional Chinese. Models/provider defaults come from normal Codex settings.
 
-Install `exiftool` and `qpdf` with your distribution's package manager when
-you need to send images or PDFs. Missing cleanup tools prevent sending those
-files, while normal text commands remain available.
+The host approval allowlist is `on-request,untrusted` and applies to Telegram
+changes and restored chat options. Full Access keeps that confirmation policy.
+The bridge has no interactive approval UI; required operations must run locally.
+Snapshots retain 14 days; terminal history/uploads retain 30 days. Active work
+and undelivered results are protected. Global Codex cleanup is disabled by setup.
 
-## Linux autostart
-
-The supplied units assume the checkout is `~/codex-telegram-bridge`. Install them:
-
-```sh
-mkdir -p ~/.config/systemd/user
-cp systemd/codex-telegram-{bot,worker}.service ~/.config/systemd/user/
-```
-
-Check `command -v node` and `command -v codex` from your configured terminal.
-If Node.js 24 is outside the units' PATH, adjust `ExecStart` to its absolute path.
-Set `CODEX_PATH` in `.env` if your chosen CLI needs an absolute path. Then enable:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now codex-telegram-worker codex-telegram-bot
-systemctl --user status codex-telegram-worker codex-telegram-bot
-```
-
-The units use private `UMask=0077`. Keeping services running after logout may
-require enabling user lingering according to the host's administration policy.
-
-## Settings and files
-
-Use `/settings` for model, reasoning, queue and interface preferences. UI
-languages are English, Korean, Russian and Traditional Chinese. Configure model
-and provider defaults through your normal Codex settings; setup pins neither.
-Optional environment settings are listed in `.env.example`.
-
-The host approval allowlist defaults to `on-request,untrusted` and applies to
-both Telegram changes and restored chat options. `danger-full-access` remains
-available with that policy. The bridge has no interactive approval UI; an
-operation requiring approval may need to be run locally.
-
-Snapshots retain 14 days; finished worker history and uploads retain 30 days
-by default. Active work and undelivered results are protected. Global Codex
-cleanup is disabled by the macOS installer; Linux's minimal config retains the
-manual cleanup policy. See [runtime storage](runtime-optimization.md).
-
-Outgoing images must be PNG/JPEG under the selected project's `outputs/` folder.
+Outgoing images must be PNG/JPEG under the chosen project's `outputs/` folder.
 The cleaner also supports PDF, DOCX/XLSX/PPTX, SVG and UTF-8 text/HTML/JSON/CSV.
-It cleans a separate copy and reports actions. GIF/WebP and unknown formats
-are refused; document content, comments and embedded Office images are not
-redacted. Configure a custom cleaner explicitly with `FILE_METADATA_CLEANER`.
+It cleans a copy and reports actions; content, comments and embedded Office
+images are not redacted. Custom cleaners require explicit `FILE_METADATA_CLEANER`.
 
-Stop an older installation before using the same bot token. The shared lock
-prevents duplicate polling, and runtime state is not imported automatically.
-Use the [rollback procedure](rollback.md) when changing a running installation.
+## Manual Linux configuration
+
+Existing manual deployments can still copy `.env.minimal.example`, edit the
+allowlists and absolute paths, and run `chmod 600 .env`. Run `npm ci`, then
+`npm run start:worker` and `npm start`. The legacy sample units in `systemd/`
+use `codex-telegram-bot/worker.service`; the wizard uses separate bridge unit
+names and does not overwrite those units. Configure absolute Node/Codex paths
+when they are outside a service's PATH. dotenv does not expand `$HOME` values.

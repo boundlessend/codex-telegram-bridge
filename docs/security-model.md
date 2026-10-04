@@ -5,6 +5,12 @@ processing Telegram updates. Private conversations and groups have distinct
 allowlist rules. A compromised allowed Telegram account can still issue tasks;
 this service has no second factor or independent user confirmation UI.
 
+Initial setup binds the owner through a fresh, one-time private Telegram
+challenge. Forwarded, stale and group messages cannot claim the installation.
+Pairing does not run Codex tasks. The token and pairing link belong only in the
+local terminal. Existing webhook configuration and another local polling
+instance block pairing rather than being replaced automatically.
+
 Normal tasks retain on-request or untrusted approval policy by default. The
 host allowlist restricts Telegram policy changes; only a local operator can
 change that boundary. Side tasks use read-only mode without extra writable
@@ -21,8 +27,10 @@ idle watchdogs bound common failure modes. They do not guarantee that every
 external tool terminates or every task succeeds. Inspect failed jobs locally
 before retrying actions that may already have changed external state.
 
-Credentials remain in local Keychain on macOS or a restricted dotenv file on
-Linux. Snapshots and logs contain user content and must remain local. Retention
+Managed credentials remain in local Keychain on macOS or an owner-only token
+file on Linux; legacy manual Linux installs use restricted dotenv. Runtime
+copies and state are independent of plugin caches. Snapshots and logs contain
+user content and must remain local. Retention
 protects undelivered results, which can outlive the nominal retention period.
 Metadata cleaning does not redact content, comments, tracked changes, embedded
 Office images or steganography. Do not send a file containing private content

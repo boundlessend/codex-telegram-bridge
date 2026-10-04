@@ -1,88 +1,73 @@
 # codex-telegram-bridge
 
-Control a local Codex session from an allowlisted Telegram bot. Includes a durable
-worker, macOS Keychain setup, Linux service examples and an optional Codex skill.
-
-## Requirements
-
-- Node.js **24** and Python **3.10+**
-- A Telegram bot token from [BotFather](https://t.me/BotFather) and your numeric user ID
-- For outgoing PNG/JPEG/PDF files: `exiftool`; PDF also needs `qpdf`
-
-Use Node.js 24: Node.js 26 has a known Telegraf multipart upload issue.
+Control local Codex tasks from Telegram with a durable worker, secure account
+pairing and private runtime storage. Supports macOS and Linux.
 
 ## Install
 
-```sh
-git clone https://github.com/boundlessend/codex-telegram-bridge.git ~/codex-telegram-bridge
-cd ~/codex-telegram-bridge
-npm ci
-export PATH="$PWD/node_modules/.bin:$PATH"
-codex login
-```
-
-The checkout includes its own Codex CLI. Choose an existing trusted Git project
-as the working directory. Stop any older bridge using the same Telegram bot.
-
-### macOS
+Requires **Node.js 24**, **npm** and **Python 3.10+**. Linux autostart uses a
+systemd user session. Create your bot through [BotFather](https://t.me/BotFather),
+then run this in your own terminal:
 
 ```sh
-python3 runtime/setup.py --workdir /absolute/path/to/your/git-project
+npx --yes --package github:boundlessend/codex-telegram-bridge codex-telegram-bridge setup
 ```
 
-Enter the token into the hidden terminal prompt and provide your user ID. Setup
-checks Telegram and a read-only Codex response using your account, then stores
-the token in Keychain. Answer `yes` to enable login autostart.
+The wizard asks for a trusted Git project and a hidden bot token. Open its
+one-time Telegram link to bind your account, then choose whether to start the
+services automatically. No numeric user ID, `.env` editing or manual service
+files are needed. It checks your existing Codex login and offers login only
+when required; the read-only SDK check uses your normal account.
+
+Stop an older bridge polling the same bot before pairing. Dependencies and
+runtime code are installed in a permanent private folder outside plugin caches.
+For repeat commands, use the same `npx` prefix with `doctor`, `status`, `start`,
+`stop`, `restart` or `uninstall` instead of `setup`.
+
+## Codex plugin
+
+The plugin is available through Senya Plugins:
 
 ```sh
-python3 runtime/manage.py doctor
-python3 runtime/manage.py status
-python3 runtime/manage.py restart
+codex plugin marketplace add boundlessend/yougile-tracking
+codex plugin marketplace upgrade senya-plugins
+codex plugin add codex-telegram-bridge@senya-plugins
 ```
 
-### Linux
-
-```sh
-cp .env.minimal.example .env
-chmod 600 .env
-```
-
-Edit `.env`: set `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS`, `CODEX_WORKDIR` and
-`CODEX_TELEGRAM_STATE_DIR`. Use absolute paths and keep state outside the checkout.
-Run `npm run start:worker` and `npm start` in separate terminals. For autostart,
-follow the [systemd setup](docs/setup.md#linux-autostart).
+Invoke `$codex-telegram-bridge` for setup or maintenance help. The skill keeps
+token input in your local terminal. Removing the plugin does not stop its
+independent daemon: run the bridge's `uninstall` command first when retiring it.
+Uninstall unregisters user services and keeps local settings and history.
 
 ## Use
 
-Open your bot, send `/start`, then a small task. Verify the complete connection
-with `Reply exactly TELEGRAM_CODEX_OK without tools`.
+Send `/start`, then a small task. Verify complete delivery with
+`Reply exactly TELEGRAM_CODEX_OK without tools`.
 
-`/menu`, `/new`, `/resume`, `/queue`, `/settings`, `/status`, `/doctor` and `/stop`
-cover normal operation. `/settings` also selects the interface language.
+Use `/menu`, `/new`, `/resume`, `/queue`, `/settings`, `/status`, `/doctor` and
+`/stop`. Defaults are `workspace-write` and `on-request`. Full Access remains
+available with confirmations retained. Interactive approvals cannot be accepted
+from Telegram; perform those operations locally.
 
-Defaults are `workspace-write` and `on-request`. Full Access is available with
-confirmations retained. Interactive approval requests cannot be accepted from
-Telegram; perform those operations locally. Keep credentials, logs and state
-out of Git. `/cleanup_uploads` previews files; deletion requires
-`Confirm upload cleanup`.
+Images belong in the project's `outputs/` folder. File metadata is cleaned
+before sending; PNG/JPEG/PDF require `exiftool`, and PDF also needs `qpdf`.
+GIF/WebP are refused. Cleaning does not redact private content.
+`/cleanup_uploads` previews files; deletion requires `Confirm upload cleanup`.
 
-Image artifacts belong in the project's `outputs/` folder. Files are cleaned
-before sending; GIF/WebP are refused. Cleaning does not redact private content.
-See [setup and configuration](docs/setup.md) and the [security model](docs/security-model.md).
+See [setup and configuration](docs/setup.md), [security](docs/security-model.md)
+and [rollback](docs/rollback.md). Keep credentials, state and logs out of Git.
 
-## Optional skill and development
-
-Copy `skills/codex-telegram-bridge` into `~/.codex/skills/` and reopen Codex.
-Invoke `$codex-telegram-bridge` with the checkout path for maintenance help.
+## Development
 
 ```sh
+npm ci
 npm run verify
 npm run audit:ci
 ```
 
-Tests require OpenSSL. CI verifies Linux and macOS on Node.js 24. See
-[architecture](docs/architecture.md), [release checks](docs/release-checklist.md)
-and [rollback](docs/rollback.md).
+CI verifies macOS and Linux on Node.js 24. Tests require OpenSSL. See
+[architecture](docs/architecture.md) and [release checks](docs/release-checklist.md).
+Node.js 26 has a known Telegraf multipart upload issue; the wizard requires 24.
 
 ## License
 

@@ -1,41 +1,40 @@
 ---
 name: codex-telegram-bridge
-description: Set up, inspect, troubleshoot or maintain a local codex-telegram-bridge service that receives Codex commands through an allowlisted Telegram bot. Use when the user asks about this bridge, its worker, Keychain setup, service status or restarting its installation.
+description: Set up, pair, inspect or maintain the local Codex Telegram Bridge on macOS or Linux. Use for its installer, worker, service status, restarts or removal; keep all credential input in the user's own terminal.
 ---
 
 # Codex Telegram Bridge
 
-Ask for the repository checkout path if unknown. Read its README.md and project
-instructions before acting. Do not assume a personal directory or copy settings
-from another bridge installation.
+Find the plugin root containing `plugin.json`, `bin/` and `runtime/`. Read its
+README.md and applicable project instructions. The installed daemon has its own
+permanent runtime; it must not depend on the plugin cache remaining available.
 
-On macOS use `python3 runtime/manage.py doctor` for prerequisites and
-`python3 runtime/manage.py status` for LaunchAgent registration. Doctor does
-not read credentials. Status alone does not prove Telegram polling is healthy.
+For setup, give the user this command to run in their own terminal:
 
-For setup, guide the user to run `python3 runtime/setup.py --workdir PROJECT`
-from the checkout in their terminal. Token input belongs only in the hidden
-local prompt, never in chat, tool output or an assistant-generated command
-argument. The installer checks Telegram and Codex before saving credentials
-and asks before enabling autostart. It does not modify global Codex settings.
+```sh
+npx --yes --package github:boundlessend/codex-telegram-bridge codex-telegram-bridge setup
+```
 
-For an authorized service change use `python3 runtime/manage.py start`, `stop`
-or `restart`. These control only the bridge's macOS labels. On Linux read the
-systemd units and README instead. Before starting, establish whether another
-installation polls the same bot; stop it only with the user's authorization.
-Do not disable the shared instance lock.
+They select a Git project, enter the token through a hidden prompt, and open the
+one-time Telegram pairing link. Do not execute secret-interactive setup through
+assistant tools, request a token in chat, or print a stored token/pairing link.
+Setup checks prerequisites and existing Codex login, verifies a real read-only
+response, and asks before starting user services. Stop older polling instances
+only with the user's authorization; do not disable the shared lock.
 
-Keep approval policy on-request or untrusted. Full Access remains possible when
-explicitly requested with confirmations retained. Never select approval never
-or silently bypass safeguards. The bridge cannot accept interactive approvals
-from Telegram; required operations may need to be performed locally.
+For inspection use `node <plugin-root>/bin/codex-telegram-bridge doctor` and
+`status`. For authorized changes use `start`, `stop`, `restart` or `uninstall`.
+These work on macOS and Linux. Uninstall unregisters owned services and retains
+private data. Before removing the plugin itself, offer to unregister its daemon;
+plugin removal alone leaves that independent service running.
 
-After code changes run `npm run verify`. After a live restart inspect safe startup
-status locally, then ask the user to send `Reply exactly TELEGRAM_CODEX_OK without
-tools` from Telegram. Distinguish prerequisites, loaded services, polling,
-Codex SDK response and actual end-to-end delivery in the report.
+Keep on-request or untrusted approvals. Full Access is available when explicitly
+requested with confirmations retained. Never bypass safeguards or choose never.
+Interactive approvals cannot be accepted through Telegram.
 
-Do not print settings.json, dotenv contents, tokens, session content or process
-environments. Do not publish state, logs or backups. Investigate cleaning
-failures locally without disabling cleaning. Updating source, restarting services
-and publishing a repository are separate user actions.
+After changes run `npm run verify`. After a live restart inspect safe service
+status and ask the user to send `Reply exactly TELEGRAM_CODEX_OK without tools`.
+Distinguish prerequisites, service state, SDK response and actual Telegram delivery.
+Do not print settings, credentials, full process environments, logs or session
+content into the conversation. A cleaning failure must be diagnosed without
+disabling cleaning. See `docs/setup.md` for runtime paths and migration details.

@@ -32,8 +32,11 @@ export function createWorkerServer({
   let maintenanceStart;
   let maintenanceTask;
   const archiveLogs = () => {
+    if (maintenanceTask) return;
     maintenanceTask = maintenance.prune().then(() => maintenance.run({ apply: true })).catch((error) => {
       logger.warn?.("worker log archival skipped:", error instanceof Error ? error.message : String(error));
+    }).finally(() => {
+      maintenanceTask = null;
     });
   };
 

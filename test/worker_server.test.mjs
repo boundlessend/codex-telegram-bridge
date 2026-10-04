@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { createWorkerClient } from "../src/worker/client.js";
 import { createWorkerServer } from "../src/worker/server.js";
 import { createWorkerStore } from "../src/worker/store.js";
@@ -10,6 +11,72 @@ import { createWorkerStore } from "../src/worker/store.js";
 function mode(stat) {
   return stat.mode & 0o777;
 }
+
+test("scheduled maintenance does not overlap and shutdown waits for its filesystem work", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "worker-maintenance-"));
+  const config = {
+    codexWorkerStateDir: directory,
+    codexWorkerSocket: path.join(directory, "worker.sock"),
+    codexWorkerLogRetentionDays: 30,
+    stateFile: path.join(directory, "bot-state.json"),
+    botRecoveryDir: path.join(directory, "recovery")
+  };
+  await fs.writeFile(config.stateFile, "{}");
+  const store = createWorkerStore(config);
+  await store.ensure();
+  await store.writeJobState({ id: "old-failed", status: "failed", completedAt: "2020-01-01T00:00:00Z" });
+  let releaseWork;
+  let enteredWork;
+  const gate = new Promise((resolve) => { releaseWork = resolve; });
+  const entered = new Promise((resolve) => { enteredWork = resolve; });
+  let visits = 0;
+  const lock = store.withJobLock;
+  store.withJobLock = async (id, action) => {
+    visits += 1;
+    enteredWork();
+    await gate;
+    return lock(id, action);
+  };
+  let initialTick;
+  let repeatTick;
+  const timeout = globalThis.setTimeout;
+  const interval = globalThis.setInterval;
+  t.mock.method(globalThis, "setTimeout", (callback, milliseconds, ...args) => {
+    if (milliseconds === 60_000) {
+      initialTick = callback;
+      return timeout(() => {}, 2_000_000_000);
+    }
+    return timeout(callback, milliseconds, ...args);
+  });
+  t.mock.method(globalThis, "setInterval", (callback, milliseconds, ...args) => {
+    if (milliseconds === 3_600_000) {
+      repeatTick = callback;
+      return interval(() => {}, 2_000_000_000);
+    }
+    return interval(callback, milliseconds, ...args);
+  });
+  const worker = createWorkerServer({ config, store, logger: { warn() {} } });
+  t.after(async () => {
+    releaseWork();
+    await worker.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+  await worker.listen();
+  assert.equal(typeof initialTick, "function");
+  assert.equal(typeof repeatTick, "function");
+  initialTick();
+  await entered;
+  repeatTick();
+  await delay(50);
+  assert.equal(visits, 1);
+  const closing = worker.close();
+  await delay(20);
+  assert.equal(worker.server.listening, true);
+  releaseWork();
+  await closing;
+  assert.equal(worker.server.listening, false);
+  assert.equal(await store.readJobState("old-failed"), null);
+});
 
 async function startServer(executeJob, options = {}) {
   const { prepareStore, ...serverOptions } = options;

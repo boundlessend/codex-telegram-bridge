@@ -27,12 +27,12 @@ async function makeTempDir() {
 
 test("classifies common CI failures with evidence and commands", async () => {
   const cases = [
-    ["jq-error.log", "workflow-script-failure", "actionlint"],
-    ["npm-lock-error.log", "npm-ci-failure", "npm ci"],
-    ["prettier-error.log", "format-failure", "npm run format:check"],
-    ["network-timeout.log", "registry-network-transient", "gh run rerun --failed"],
-    ["test-assertion.log", "test-failure", "npm test"],
-    ["permission-error.log", "permission-token-failure", "permissions"],
+    ["jq-error.txt", "workflow-script-failure", "actionlint"],
+    ["npm-lock-error.txt", "npm-ci-failure", "npm ci"],
+    ["prettier-error.txt", "format-failure", "npm run format:check"],
+    ["network-timeout.txt", "registry-network-transient", "gh run rerun --failed"],
+    ["test-assertion.txt", "test-failure", "npm test"],
+    ["permission-error.txt", "permission-token-failure", "permissions"],
   ];
 
   for (const [fixture, type, commandFragment] of cases) {
@@ -100,7 +100,7 @@ test("redacts secret-like values before markdown output", () => {
 test("generates authless diagnosis markdown from run, jobs, and failed log", async () => {
   const run = JSON.parse(await readFixture("run.json"));
   const jobs = JSON.parse(await readFixture("jobs.json"));
-  const log = await readFixture("jq-error.log");
+  const log = await readFixture("jq-error.txt");
 
   const diagnosis = generateDiagnosis({ run, jobs, log, runUrl: run.url, prNumber: 17 });
 
@@ -153,7 +153,7 @@ test("CLI writes markdown and json diagnosis artifacts", async () => {
   const jsonOut = path.join(tmp, "diagnosis.json");
   const logDir = path.join(tmp, "logs");
   await fs.mkdir(logDir);
-  await fs.copyFile(path.join(fixtures, "jq-error.log"), path.join(logDir, "failed-tail.log"));
+  await fs.copyFile(path.join(fixtures, "jq-error.txt"), path.join(logDir, "failed-tail.log"));
 
   await execFileAsync(
     process.execPath,

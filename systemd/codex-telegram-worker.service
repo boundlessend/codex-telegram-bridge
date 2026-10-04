@@ -7,7 +7,7 @@ Type=simple
 UMask=0077
 WorkingDirectory=%h/codex-telegram-bridge
 EnvironmentFile=%h/codex-telegram-bridge/.env
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/codex-telegram-bridge/node_modules/.bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/env node %h/codex-telegram-bridge/src/worker.js
 Restart=always
 RestartSec=5

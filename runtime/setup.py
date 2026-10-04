@@ -34,7 +34,7 @@ def validate_token(token: str) -> None:
         except urllib.error.URLError:
             if attempt == 2:
                 raise SetupError("Telegram is unreachable after three attempts") from None
-            print("Telegram недоступен, повторяю проверку токена")
+            print("Telegram is unreachable; retrying token validation")
             continue
         if not isinstance(value, dict) or value.get("ok") is not True:
             raise SetupError("Telegram did not confirm the bot token")
@@ -65,14 +65,14 @@ def install_service(label: str, entrypoint: Path) -> None:
     atomic_write(target, plistlib.dumps(contents))
     target.chmod(0o600)
     domain = "gui/" + str(os.getuid())
-    status = subprocess.run(["launchctl", "print", domain + "/" + label], capture_output=True, text=True)
+    status = subprocess.run(["launchctl", "print", domain + "/" + label], capture_output=True, text=True, timeout=10)
     if status.returncode == 0:
         subprocess.run(["launchctl", "bootout", domain + "/" + label], check=True, timeout=15)
         subprocess.run(["launchctl", "bootstrap", domain, str(target)], check=True, timeout=15)
     elif "Could not find service" in status.stderr:
-        subprocess.run(["launchctl", "bootstrap", domain, str(target)], check=True)
+        subprocess.run(["launchctl", "bootstrap", domain, str(target)], check=True, timeout=15)
     else:
-        raise SetupError("LaunchAgent lookup failed: " + status.stderr.strip())
+        raise SetupError("LaunchAgent lookup failed: exit_code=" + str(status.returncode))
 
 
 def main() -> None:
@@ -161,15 +161,13 @@ def main() -> None:
         else:
             target.unlink(missing_ok=True)
         raise
-    print("Токен и настройки сохранены после успешной проверки")
-    print("Реальная проверка Codex SDK прошла")
-    print("При запуске бот зарегистрирует меню Telegram и будет отвечать на твои сообщения")
-    if input("Запустить бота и включить автозапуск сейчас? [yes/no]: ").strip().lower() != "yes":
-        print("Автозапуск не включён. Для запуска повтори эту команду")
+    print("Token and settings saved after successful Telegram and Codex SDK checks")
+    if input("Start the bot and enable login autostart now? [yes/no]: ").strip().lower() != "yes":
+        print("Autostart is disabled. Run setup again to install the LaunchAgents")
         return
     install_service("local.codex.telegram.bridge.worker", ROOT / "run_worker.py")
     install_service("local.codex.telegram.bridge.bot", ROOT / "run_bot.py")
-    print("Службы запущены. Открой своего бота в Telegram и отправь /start, затем тестовую задачу")
+    print("Services started. Open your bot in Telegram and send /start, then a small test task")
 
 
 if __name__ == "__main__":
